@@ -8,6 +8,8 @@ The [repository README](../README.md) describes the server status, deployment op
 - [Operations runbook](RUNBOOK.md)
 - [Deployment manifests](../deploy/)
 
+- [Persistence and delivery guarantees](DURABILITY.md)
+
 ## Design and fixtures
 
 - [Design decisions and open concerns](../DECISIONS.md)
