@@ -202,6 +202,10 @@ type Room struct {
 	aw    *protocol.Awareness
 	docID store.UUID
 	owner store.UUID
+	// incarnation is fixed at load; snapshotGeneration advances only when this
+	// room's writer confirms a compaction.
+	incarnation        int64
+	snapshotGeneration int64
 	// usage is what the document costs, measured on the tick and published for
 	// the manager's memory budget. See memory.go.
 	usage usage

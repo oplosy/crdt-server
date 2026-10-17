@@ -27,7 +27,7 @@ type Persistence interface {
 	// document before a room exists.
 	Ensure(ctx context.Context, id store.UUID, name string, owner store.UUID) (store.UUID, error)
 	Append(ctx context.Context, id store.UUID, payloads [][]byte) ([]int64, error)
-	Compact(ctx context.Context, id store.UUID, snapshot []byte, folded []int64) error
+	Compact(ctx context.Context, id, owner store.UUID, incarnation, generation int64, snapshot []byte, folded []int64) (int64, error)
 }
 
 // Versioning is the part of internal/store a room needs to keep history. It is
@@ -79,6 +79,8 @@ func (r *Room) load(ctx context.Context) error {
 		r.metrics.StoreFailed.WithLabelValues("load").Inc()
 		return err
 	}
+	r.incarnation = doc.Incarnation
+	r.snapshotGeneration = doc.SnapshotGeneration
 	defer func() { metrics.Observe(r.metrics.LoadDuration, started) }()
 	metrics.Observe(r.metrics.StoreDuration.WithLabelValues("load"), started)
 	if doc.Snapshot != nil {
@@ -270,10 +272,11 @@ func (r *Room) compact(snapshot []byte) {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
-	err := r.cfg.Store.Compact(ctx, r.docID, snapshot, r.folded)
+	generation, err := r.cfg.Store.Compact(ctx, r.docID, r.owner, r.incarnation, r.snapshotGeneration, snapshot, r.folded)
 	metrics.Observe(r.metrics.StoreDuration.WithLabelValues("compact"), started)
 	switch {
 	case err == nil:
+		r.snapshotGeneration = generation
 		r.metrics.Compactions.Inc()
 		r.log.Info("compacted", "rows", len(r.folded), "snapshot", len(snapshot))
 		// Those rows are gone; a later snapshot must not try to delete them

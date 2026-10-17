@@ -114,7 +114,7 @@ func TestASnapshotGoesToTheBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(ctx, id, snapshot, seqs); err != nil {
+	if err := compactCurrent(t, s, ctx, id, snapshot, seqs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -153,7 +153,7 @@ func TestAListingReportsTheSizeOfABlobBackedDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(ctx, id, snapshot, seqs); err != nil {
+	if err := compactCurrent(t, s, ctx, id, snapshot, seqs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -244,7 +244,7 @@ func TestRowsInTheDatabaseAndInTheBucketReadTheSame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := plain.Compact(ctx, inlineID, inlineBytes, seqs); err != nil {
+	if err := compactCurrent(t, plain, ctx, inlineID, inlineBytes, seqs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -255,7 +255,7 @@ func TestRowsInTheDatabaseAndInTheBucketReadTheSame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(ctx, bucketID, bucketBytes, seqs); err != nil {
+	if err := compactCurrent(t, s, ctx, bucketID, bucketBytes, seqs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -297,7 +297,7 @@ func TestARowNamingAnObjectWithNoBucketIsAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(ctx, id, bytes.Repeat([]byte("content "), 100), seqs); err != nil {
+	if err := compactCurrent(t, s, ctx, id, bytes.Repeat([]byte("content "), 100), seqs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -326,7 +326,7 @@ func TestAFailedPutWritesNoRow(t *testing.T) {
 	rec.failPuts = true
 	rec.mu.Unlock()
 
-	if err := s.Compact(ctx, id, bytes.Repeat([]byte("never lands "), 100), seqs); err == nil {
+	if err := compactCurrent(t, s, ctx, id, bytes.Repeat([]byte("never lands "), 100), seqs); err == nil {
 		t.Fatal("compaction succeeded with a bucket that was refusing writes")
 	}
 	// No snapshot, and the log row survives, so the document is exactly as it
@@ -359,7 +359,7 @@ func TestDeletingADocumentDeletesItsObjects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(ctx, id, bytes.Repeat([]byte("snapshot "), 100), seqs); err != nil {
+	if err := compactCurrent(t, s, ctx, id, bytes.Repeat([]byte("snapshot "), 100), seqs); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.SaveVersion(ctx, id,
@@ -452,7 +452,7 @@ func TestANewSnapshotRemovesTheOneItReplaces(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Compact(ctx, id, bytes.Repeat([]byte(fmt.Sprintf("round %d ", i)), 100), seqs); err != nil {
+		if err := compactCurrent(t, s, ctx, id, bytes.Repeat([]byte(fmt.Sprintf("round %d ", i)), 100), seqs); err != nil {
 			t.Fatal(err)
 		}
 		key, _ := snapshotPlacement(t, s, id)

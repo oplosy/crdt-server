@@ -4,6 +4,11 @@
 -- append-only log of updates that arrived after it. Loading a document is the
 -- snapshot followed by every remaining log row, in seq order.
 
+-- New document incarnations need identifiers that are not reused after a row
+-- is deleted and recreated. Legacy rows retain zero; callers compare tokens
+-- for equality and do not rely on sequence continuity.
+CREATE SEQUENCE IF NOT EXISTS document_incarnation_seq;
+
 CREATE TABLE IF NOT EXISTS documents (
     id            UUID PRIMARY KEY,
     owner_id      UUID NOT NULL,
@@ -31,6 +36,8 @@ CREATE TABLE IF NOT EXISTS documents (
     -- snapshot_key is empty: the column beside it already knows its own size.
     snapshot_bytes BIGINT NOT NULL DEFAULT 0,
     snapshot_seq  BIGINT NOT NULL DEFAULT 0,
+    snapshot_generation BIGINT NOT NULL DEFAULT 0,
+    incarnation   BIGINT NOT NULL DEFAULT nextval('document_incarnation_seq'),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -43,6 +50,9 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS snapshot_key TEXT NOT NULL DEFAUL
 -- which is a listing that understates a document rather than one that cannot be
 -- read. Backfilling is impossible from here: only the bucket knows the size.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS snapshot_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS snapshot_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS incarnation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE documents ALTER COLUMN incarnation SET DEFAULT nextval('document_incarnation_seq');
 
 -- Listing is always "this owner's documents, by name". The owner comes first
 -- because it is the equality, and multi-tenancy makes it the selective one.

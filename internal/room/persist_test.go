@@ -60,6 +60,7 @@ func (f *fakeStore) Load(_ context.Context, _ store.UUID, name string, owner sto
 	}
 	doc := f.doc
 	doc.Owner = owner
+	doc.Exists = true
 	return &doc, nil
 }
 
@@ -88,7 +89,7 @@ func (f *fakeStore) Append(_ context.Context, _ store.UUID, payloads [][]byte) (
 	return seqs, nil
 }
 
-func (f *fakeStore) Compact(_ context.Context, _ store.UUID, snapshot []byte, folded []int64) error {
+func (f *fakeStore) Compact(_ context.Context, _ store.UUID, _ store.UUID, _ int64, generation int64, snapshot []byte, folded []int64) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.snapshots = append(f.snapshots, snapshot)
@@ -99,8 +100,9 @@ func (f *fakeStore) Compact(_ context.Context, _ store.UUID, snapshot []byte, fo
 			watermark = seq
 		}
 	}
-	f.doc = store.Document{Snapshot: snapshot, SnapshotSeq: watermark}
-	return nil
+	f.doc = store.Document{Exists: true, Snapshot: snapshot, SnapshotSeq: watermark,
+		Owner: f.doc.Owner, Incarnation: f.doc.Incarnation, SnapshotGeneration: generation + 1}
+	return generation + 1, nil
 }
 
 // lastFolded returns the rows the most recent snapshot claimed to cover.

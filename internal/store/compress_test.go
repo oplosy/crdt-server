@@ -33,7 +33,7 @@ func compact(t *testing.T, s *store.Store, id store.UUID, snapshot []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(t.Context(), id, snapshot, seqs); err != nil {
+	if err := compactCurrent(t, s, t.Context(), id, snapshot, seqs); err != nil {
 		t.Fatal(err)
 	}
 }

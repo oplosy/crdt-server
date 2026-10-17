@@ -53,16 +53,15 @@ func (s *Store) UseBlobs(b Blobs, log *slog.Logger) {
 	}
 }
 
-// snapshotKey names a document's snapshot object.
-//
-// The sequence number is part of the key, and that is not decoration. Two
-// replicas can compact the same document at once: the advisory lock and the
-// snapshot_seq guard decide which of them wins the row, but if both had written
-// to one key the loser's bytes could be the ones left behind, under a row that
-// says they are the winner's. A key per sequence number means the row and the
-// object it names always agree, and the loser's object is an orphan.
-func snapshotKey(id UUID, seq int64) string {
-	return fmt.Sprintf("snapshots/%s/%d", id, seq)
+// uniqueSnapshotKey names one immutable snapshot attempt. A key per attempt
+// prevents a losing same-watermark compaction from overwriting bytes named by
+// the winner's row.
+func uniqueSnapshotKey(id UUID) (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("store: snapshot key: %w", err)
+	}
+	return fmt.Sprintf("snapshots/%s/%s", id, hex.EncodeToString(b[:])), nil
 }
 
 // versionKey names a version's payload object.

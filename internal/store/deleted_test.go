@@ -26,7 +26,11 @@ func TestARoomThatOutlivedItsDocumentCannotBringItBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(ctx, id, bytes.Repeat([]byte("a document"), 10), seqs); err != nil {
+	base, err := s.LoadAny(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Compact(ctx, id, base.Owner, base.Incarnation, base.SnapshotGeneration, bytes.Repeat([]byte("a document"), 10), seqs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -45,7 +49,7 @@ func TestARoomThatOutlivedItsDocumentCannotBringItBack(t *testing.T) {
 	// contents and all. It cannot - Compact only ever updates a row it expects
 	// to find, and it reads the key of the snapshot it is replacing first, so it
 	// gives up before writing anything.
-	if err := s.Compact(ctx, id, bytes.Repeat([]byte("the whole document"), 10), seqs); err == nil {
+	if _, err := s.Compact(ctx, id, base.Owner, base.Incarnation, base.SnapshotGeneration, bytes.Repeat([]byte("the whole document"), 10), seqs); err == nil {
 		t.Error("compacting a deleted document was accepted")
 	}
 
