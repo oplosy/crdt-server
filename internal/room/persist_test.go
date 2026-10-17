@@ -3,8 +3,10 @@ package room
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -18,14 +20,17 @@ import (
 // exercised by the integration tests; this is here so the room's own behaviour -
 // what it writes and when - can be checked without a database.
 type fakeStore struct {
-	mu        sync.Mutex
-	doc       store.Document
-	appended  [][]byte
-	snapshots [][]byte
-	folded    [][]int64
-	seq       int64
-	loadErr   error
-	appendErr error
+	mu               sync.Mutex
+	doc              store.Document
+	appended         [][]byte
+	snapshots        [][]byte
+	folded           [][]int64
+	seq              int64
+	loadErr          error
+	appendErr        error
+	compactConflicts int
+	compactCalls     int
+	conflictDoc      store.Document
 	// owners is the tenancy boundary: whoever opened a name first owns it.
 	owners map[string]store.UUID
 }
@@ -61,6 +66,8 @@ func (f *fakeStore) Load(_ context.Context, _ store.UUID, name string, owner sto
 	doc := f.doc
 	doc.Owner = owner
 	doc.Exists = true
+	f.doc.Owner = owner
+	f.doc.Exists = true
 	return &doc, nil
 }
 
@@ -86,12 +93,30 @@ func (f *fakeStore) Append(_ context.Context, _ store.UUID, payloads [][]byte) (
 		seqs = append(seqs, f.seq)
 	}
 	f.appended = append(f.appended, payloads...)
+	f.doc.Exists = true
+	for i, payload := range payloads {
+		copyPayload := append([]byte(nil), payload...)
+		f.doc.Updates = append(f.doc.Updates, copyPayload)
+		f.doc.Seqs = append(f.doc.Seqs, seqs[i])
+		if seqs[i] > f.doc.LastSeq {
+			f.doc.LastSeq = seqs[i]
+		}
+	}
 	return seqs, nil
 }
 
-func (f *fakeStore) Compact(_ context.Context, _ store.UUID, _ store.UUID, _ int64, generation int64, snapshot []byte, folded []int64) (int64, error) {
+func (f *fakeStore) Compact(_ context.Context, _ store.UUID, owner store.UUID, incarnation, generation int64, snapshot []byte, folded []int64) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.compactCalls++
+	if f.compactConflicts > 0 {
+		f.compactConflicts--
+		f.doc = f.conflictDoc
+		return generation, store.ErrStaleSnapshot
+	}
+	if owner != f.doc.Owner || incarnation != f.doc.Incarnation || generation != f.doc.SnapshotGeneration {
+		return generation, store.ErrStaleSnapshot
+	}
 	f.snapshots = append(f.snapshots, snapshot)
 	f.folded = append(f.folded, folded)
 	var watermark int64
@@ -100,8 +125,25 @@ func (f *fakeStore) Compact(_ context.Context, _ store.UUID, _ store.UUID, _ int
 			watermark = seq
 		}
 	}
-	f.doc = store.Document{Exists: true, Snapshot: snapshot, SnapshotSeq: watermark,
-		Owner: f.doc.Owner, Incarnation: f.doc.Incarnation, SnapshotGeneration: generation + 1}
+	if f.doc.SnapshotSeq > watermark {
+		watermark = f.doc.SnapshotSeq
+	}
+	covered := make(map[int64]struct{}, len(folded))
+	for _, seq := range folded {
+		covered[seq] = struct{}{}
+	}
+	var updates [][]byte
+	var seqs []int64
+	for i, seq := range f.doc.Seqs {
+		if _, ok := covered[seq]; ok {
+			continue
+		}
+		updates = append(updates, f.doc.Updates[i])
+		seqs = append(seqs, seq)
+	}
+	f.doc = store.Document{Exists: true, Snapshot: append([]byte(nil), snapshot...), SnapshotSeq: watermark,
+		Updates: updates, Seqs: seqs, Owner: f.doc.Owner, Incarnation: f.doc.Incarnation,
+		SnapshotGeneration: generation + 1, LastSeq: f.doc.LastSeq}
 	return generation + 1, nil
 }
 
@@ -234,6 +276,367 @@ func TestCompactionAfterThreshold(t *testing.T) {
 	// range and take rows it never saw with it (C6).
 	if got := fake.lastFolded(); len(got) != 6 {
 		t.Fatalf("snapshot covers %v, want the 6 rows that were written", got)
+	}
+}
+
+func TestCompactRebasesAfterGenerationConflict(t *testing.T) {
+	updates := scenarioUpdates(t, "text-three-client-interleaved")
+	if len(updates) < 7 {
+		t.Fatalf("need at least 7 scenario updates, have %d", len(updates))
+	}
+	x, y, z := updates[0], updates[3], updates[6]
+	state := func(updates ...[]byte) []byte {
+		t.Helper()
+		doc := crdt.NewDoc(0)
+		for _, update := range updates {
+			if err := doc.ApplyUpdate(update); err != nil {
+				t.Fatal(err)
+			}
+		}
+		encoded, err := doc.EncodeStateAsUpdate(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+
+	owner := store.NilUUID
+	initial := store.Document{Exists: true, Snapshot: x, SnapshotSeq: 1, Owner: owner,
+		Incarnation: 11, SnapshotGeneration: 0}
+	concurrent := store.Document{Exists: true, Snapshot: state(x, y), SnapshotSeq: 2, Owner: owner,
+		Incarnation: 11, SnapshotGeneration: 1}
+	fake := &fakeStore{doc: initial, compactConflicts: 1, conflictDoc: concurrent}
+	r := New(Config{Name: "rebase", Store: fake, Logger: quietLogger()})
+	r.incarnation = initial.Incarnation
+	r.folded = []int64{1, 3}
+
+	if !r.compact(state(x, z)) {
+		t.Fatal("compaction did not recover from one generation conflict")
+	}
+	stored, err := fake.LoadAny(context.Background(), r.docID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := crdt.NewDoc(0)
+	if err := restored.ApplyUpdate(stored.Snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := restored.Text("text").String(), "zeroonethree"; got != want {
+		t.Fatalf("rebased snapshot text %q, want %q", got, want)
+	}
+	if len(r.folded) != 0 {
+		t.Fatalf("successful compaction retained folded rows %v", r.folded)
+	}
+	if got := r.doc.Text("text").String(); got != "" {
+		t.Fatalf("persist goroutine mutated the live actor document to %q", got)
+	}
+}
+
+func TestCompactDoesNotRebaseAcrossDocumentIncarnation(t *testing.T) {
+	fake := &fakeStore{doc: store.Document{Exists: true, Owner: store.NilUUID, Incarnation: 12}}
+	r := New(Config{Name: "old-room", Store: fake, Logger: quietLogger()})
+	r.incarnation = 11
+	r.folded = []int64{1}
+
+	if !r.compact([]byte{1}) {
+		t.Fatal("an incarnation mismatch should be terminal for this candidate")
+	}
+	if _, snapshots := fake.counts(); snapshots != 0 {
+		t.Fatalf("stale room wrote %d snapshots into the recreated document", snapshots)
+	}
+}
+
+func TestCompactKeepsPendingRowsUntilDependenciesArrive(t *testing.T) {
+	updates := scenarioUpdates(t, "text-three-client-interleaved")
+	var pendingUpdate []byte
+	for _, update := range updates {
+		doc := crdt.NewDoc(0)
+		if err := doc.ApplyUpdate(update); err != nil {
+			t.Fatal(err)
+		}
+		if doc.PendingCount() > 0 {
+			pendingUpdate = update
+			break
+		}
+	}
+	if pendingUpdate == nil {
+		t.Fatal("scenario no longer contains an update that waits for missing structs")
+	}
+
+	pendingDoc := crdt.NewDoc(0)
+	if err := pendingDoc.ApplyUpdate(pendingUpdate); err != nil {
+		t.Fatal(err)
+	}
+	if pendingDoc.PendingCount() == 0 {
+		t.Fatal("selected update did not remain pending")
+	}
+	unresolved, err := pendingDoc.EncodeStateAsUpdate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeStore{doc: store.Document{Exists: true, Owner: store.NilUUID,
+		Incarnation: 13, Updates: [][]byte{pendingUpdate}, Seqs: []int64{1}, LastSeq: 1}, seq: 1}
+	r := New(Config{Name: "pending", Store: fake, Logger: quietLogger()})
+	r.incarnation = 13
+	r.folded = []int64{1}
+	if r.compact(unresolved) {
+		t.Fatal("compaction accepted a document with unresolved structs")
+	}
+	if _, snapshots := fake.counts(); snapshots != 0 {
+		t.Fatalf("compacted %d times while a struct was pending", snapshots)
+	}
+	if len(r.folded) != 1 || r.folded[0] != 1 {
+		t.Fatalf("pending compaction discarded folded rows %v", r.folded)
+	}
+
+	dependency := false
+	var dependencyUpdate []byte
+	dependencyIndex := -1
+	for i, update := range updates {
+		wasPending := pendingDoc.PendingCount() > 0
+		if err := pendingDoc.ApplyUpdate(update); err != nil {
+			t.Fatal(err)
+		}
+		if wasPending && pendingDoc.PendingCount() == 0 {
+			dependency = true
+			dependencyUpdate = update
+			dependencyIndex = i
+			break
+		}
+	}
+	if !dependency {
+		t.Fatal("scenario no longer includes the missing dependency")
+	}
+	complete, err := pendingDoc.EncodeStateAsUpdate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.Append(context.Background(), r.docID, [][]byte{dependencyUpdate}); err != nil {
+		t.Fatal(err)
+	}
+	r.folded = append(r.folded, 2)
+	if !r.compact(complete) {
+		t.Fatal("compaction did not recover after the missing dependency arrived")
+	}
+	stored, err := fake.LoadAny(context.Background(), r.docID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Updates) != 0 {
+		t.Fatalf("resolved compaction left %d log rows", len(stored.Updates))
+	}
+	restored := crdt.NewDoc(0)
+	if err := restored.ApplyUpdate(stored.Snapshot); err != nil {
+		t.Fatal(err)
+	}
+	reference := crdt.NewDoc(0)
+	if err := reference.ApplyUpdate(pendingUpdate); err != nil {
+		t.Fatal(err)
+	}
+	for _, update := range updates[:dependencyIndex+1] {
+		if err := reference.ApplyUpdate(update); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := docPrint(t, restored), docPrint(t, reference); got != want {
+		t.Fatalf("resolved snapshot differs from merged dependency state\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestCompactRetainsMalformedPersistedUpdate(t *testing.T) {
+	fake := &fakeStore{doc: store.Document{Exists: true, Owner: store.NilUUID, Incarnation: 14,
+		Updates: [][]byte{{0xff}}, Seqs: []int64{7}}}
+	r := New(Config{Name: "corrupt", Store: fake, Logger: quietLogger()})
+	r.incarnation = 14
+	r.folded = []int64{7}
+	if r.compact([]byte{0x00}) {
+		t.Fatal("compaction accepted a malformed persisted row")
+	}
+	stored, err := fake.LoadAny(context.Background(), r.docID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Updates) != 1 || len(r.folded) != 1 {
+		t.Fatalf("malformed row was pruned: updates=%d folded=%v", len(stored.Updates), r.folded)
+	}
+}
+
+func TestCompactRejectsOwnerMismatch(t *testing.T) {
+	fake := &fakeStore{doc: store.Document{Exists: true, Owner: store.OwnerID("other"), Incarnation: 15}}
+	r := New(Config{Name: "tenant", Owner: "owner", Store: fake, Logger: quietLogger()})
+	r.incarnation = 15
+	r.folded = []int64{1}
+	if !r.compact([]byte{0}) {
+		t.Fatal("owner mismatch should stop this candidate")
+	}
+	if _, snapshots := fake.counts(); snapshots != 0 {
+		t.Fatalf("owner mismatch wrote %d snapshots", snapshots)
+	}
+}
+
+func TestCompactStopsWhenDocumentIsMissing(t *testing.T) {
+	fake := &fakeStore{}
+	r := New(Config{Name: "missing", Store: fake, Logger: quietLogger()})
+	r.folded = []int64{1}
+	if !r.compact([]byte{0}) {
+		t.Fatal("missing document should terminate this candidate")
+	}
+	if _, snapshots := fake.counts(); snapshots != 0 {
+		t.Fatalf("missing document wrote %d snapshots", snapshots)
+	}
+}
+
+func TestPersistRetriesDeferredCompactionAtShutdown(t *testing.T) {
+	initial := store.Document{Exists: true, Owner: store.NilUUID, Incarnation: 16}
+	fake := &fakeStore{doc: initial, conflictDoc: initial, compactConflicts: 3}
+	r := New(Config{Name: "shutdown-retry", Store: fake, FlushInterval: time.Hour, Logger: quietLogger()})
+	r.incarnation = initial.Incarnation
+	r.folded = []int64{1}
+	jobs := make(chan persistJob, 1)
+	go r.persist(jobs)
+	jobs <- persistJob{snapshot: readFixture(t, "text-insert-single", "state.bin")}
+	close(jobs)
+
+	select {
+	case <-r.persistDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("persist worker did not stop after its bounded shutdown retry")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.compactCalls != 4 {
+		t.Fatalf("compaction attempts = %d, want 3 conflicts plus 1 shutdown retry", fake.compactCalls)
+	}
+	if len(fake.snapshots) != 1 || len(r.folded) != 0 {
+		t.Fatalf("shutdown retry result: snapshots=%d folded=%v", len(fake.snapshots), r.folded)
+	}
+}
+
+func TestCompactKeepsCandidateAfterConflictExhaustion(t *testing.T) {
+	initial := store.Document{Exists: true, Owner: store.NilUUID, Incarnation: 17}
+	fake := &fakeStore{doc: initial, conflictDoc: initial, compactConflicts: 3}
+	r := New(Config{Name: "deferred", Store: fake, Logger: quietLogger()})
+	r.incarnation = initial.Incarnation
+	r.folded = []int64{1}
+	candidate := readFixture(t, "text-insert-single", "state.bin")
+	if r.compact(candidate) {
+		t.Fatal("compaction unexpectedly succeeded after three forced conflicts")
+	}
+	if fake.compactCalls != 3 || len(r.folded) != 1 {
+		t.Fatalf("after exhaustion: attempts=%d folded=%v", fake.compactCalls, r.folded)
+	}
+	if !r.compact(candidate) {
+		t.Fatal("deferred candidate did not succeed on a later retry")
+	}
+	if fake.compactCalls != 4 || len(r.folded) != 0 {
+		t.Fatalf("after retry: attempts=%d folded=%v", fake.compactCalls, r.folded)
+	}
+}
+
+func TestCompactRebasesConcurrentReplicaUpdatesInPostgres(t *testing.T) {
+	const dbEnv = "YCOLLAB_TEST_DATABASE_URL"
+	dbURL := os.Getenv(dbEnv)
+	if dbURL == "" {
+		t.Skipf("%s is not set; start deploy/docker-compose.yml to run this", dbEnv)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s, err := store.Open(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	name := fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano())
+	id := store.DocumentID(name)
+	owner := store.NilUUID
+	if _, err := s.Load(ctx, id, name, owner); err != nil {
+		t.Fatal(err)
+	}
+	updates := scenarioUpdates(t, "text-three-client-interleaved")
+	if len(updates) < 7 {
+		t.Fatalf("need at least 7 scenario updates, have %d", len(updates))
+	}
+	x, y, z := updates[0], updates[3], updates[6]
+	xSeqs, err := s.Append(ctx, id, [][]byte{x})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Replica A loads X and later compacts its stale X+Z state.
+	a := New(Config{Name: name, Store: s, Logger: quietLogger()})
+	if err := a.load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	aDoc := crdt.NewDoc(0)
+	if err := aDoc.ApplyUpdate(x); err != nil {
+		t.Fatal(err)
+	}
+	if err := aDoc.ApplyUpdate(z); err != nil {
+		t.Fatal(err)
+	}
+	az, err := aDoc.EncodeStateAsUpdate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Replica B commits X+Y first, removing X's log row under its snapshot.
+	bDoc := crdt.NewDoc(0)
+	if err := bDoc.ApplyUpdate(x); err != nil {
+		t.Fatal(err)
+	}
+	if err := bDoc.ApplyUpdate(y); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(ctx, id, [][]byte{y}); err != nil {
+		t.Fatal(err)
+	}
+	xy, err := bDoc.EncodeStateAsUpdate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bLoaded, err := s.LoadAny(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Compact(ctx, id, owner, bLoaded.Incarnation, bLoaded.SnapshotGeneration, xy, bLoaded.Seqs); err != nil {
+		t.Fatalf("replica B compaction: %v", err)
+	}
+	zSeqs, err := s.Append(ctx, id, [][]byte{z})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.folded = append(a.folded, zSeqs...)
+
+	if !a.compact(az) {
+		t.Fatal("replica A failed to rebase and compact")
+	}
+	stored, err := s.Load(ctx, id, name, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := crdt.NewDoc(0)
+	if stored.Snapshot != nil {
+		if err := restored.ApplyUpdate(stored.Snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, update := range stored.Updates {
+		if err := restored.ApplyUpdate(update); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := restored.Text("text").String(), "zeroonethree"; got != want {
+		t.Fatalf("Postgres reload text %q, want merged X/Y/Z state %q", got, want)
+	}
+	if len(stored.Updates) != 0 {
+		t.Fatalf("successful rebase left %d already-folded log rows", len(stored.Updates))
+	}
+	if len(a.folded) != 0 {
+		t.Fatalf("successful compaction retained rows %v (initial seqs %v)", a.folded, xSeqs)
 	}
 }
 
