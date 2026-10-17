@@ -150,7 +150,7 @@ client.on('denied', ({ reason }) => showBanner(reason))
 
 It has no users and has never run in production. The engineering is checked —
 byte-for-byte against real Yjs, under the race detector against real PostgreSQL,
-Redis and MinIO — but that is a different claim from "proven by traffic", and
+Redis and RustFS — but that is a different claim from "proven by traffic", and
 you should read [Limits](../README.md#limits) before putting it in front of
 anybody.
 

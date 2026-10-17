@@ -1,15 +1,16 @@
 package blob_test
 
-// The S3 client, against a real MinIO.
+// The S3 client, against a real S3-compatible service.
 //
 // This is the only kind of test worth writing for a hand-rolled signer. A mock
 // that checks the signature against my own idea of the algorithm would agree
-// with every mistake I made; MinIO implements SigV4 independently and answers
+// with every mistake I made; RustFS implements SigV4 independently and answers
 // 403 SignatureDoesNotMatch to anything wrong. Every test here that passes is a
 // test that the signature was accepted by something that did not learn it from
 // this repository.
 //
-//	docker compose -f deploy/docker-compose.yml up -d minio
+//	docker compose -f deploy/docker-compose.yml up -d rustfs
+//	AWS_ACCESS_KEY_ID=ycollab AWS_SECRET_ACCESS_KEY=ycollab-secret AWS_DEFAULT_REGION=us-east-1 aws --endpoint-url http://127.0.0.1:9002 s3api create-bucket --bucket ycollab
 //	YCOLLAB_TEST_S3_ENDPOINT=http://127.0.0.1:9002 go test ./internal/blob/
 
 import (
