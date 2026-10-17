@@ -168,7 +168,7 @@ func New(reg prometheus.Registerer) *Metrics {
 
 		StoreDuration: factory.histogramVec(prometheus.HistogramOpts{
 			Name:    "ycollab_store_duration_seconds",
-			Help:    "Time spent in the database, by operation.",
+			Help:    "Time spent on a storage operation, including retries, by operation.",
 			Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
 		}, []string{"op"}),
 		StoreFailed: factory.counterVec(prometheus.CounterOpts{

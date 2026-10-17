@@ -59,7 +59,8 @@ type Event struct {
 	// Clients is how many connections this node had on the document.
 	Clients int
 	// Updates is how many updates this event covers: edits since the last
-	// change event, or rows since the last store event.
+	// change event, or logical updates in confirmed appends since the last store
+	// event. Ambiguous commit retries can create duplicate physical rows.
 	Updates uint64
 	// StateVector is the document's state vector at the moment of the event,
 	// which is what a receiver compares against its own copy to decide whether
