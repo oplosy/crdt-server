@@ -18,7 +18,11 @@ type gatedLoadStore struct {
 
 func (s *gatedLoadStore) Load(ctx context.Context, id store.UUID, name string, owner store.UUID) (*store.Document, error) {
 	close(s.entered)
-	<-s.release
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	return s.fakeStore.Load(ctx, id, name, owner)
 }
 

@@ -190,8 +190,8 @@ type Document struct {
 	// Exists distinguishes a missing LoadAny result from a newly created but
 	// otherwise empty document.
 	Exists bool
-	// Incarnation is stable for a row's lifetime and changes after delete and
-	// recreation. Legacy rows migrated from older schemas have token zero.
+	// Incarnation changes after delete/recreate and on owner transfer. Legacy
+	// rows migrated from older schemas have token zero.
 	Incarnation int64
 	// SnapshotGeneration advances on every successful compaction, even when
 	// snapshot_seq does not move.
