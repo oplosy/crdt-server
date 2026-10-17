@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -19,8 +20,8 @@ import (
 )
 
 // Headers a caller reads. The state vector is on every response, including the
-// 304, because it is the version: a caller compares it with its own to decide
-// whether to ask for a diff.
+// 304, as Yjs sync metadata a caller compares with its own before asking for a
+// diff. ETags validate the selected HTTP representation separately.
 const (
 	headerStateVector = "X-Ycollab-State-Vector"
 	headerResident    = "X-Ycollab-Resident"
@@ -84,13 +85,31 @@ func getDocument(manager *room.Manager, documents room.Persistence, log *slog.Lo
 				"document", name, "skipped", snapshot.Skipped)
 		}
 
-		// The state vector is the version, so it is the ETag. Two servers
-		// holding the same document produce the same one, which is what makes
-		// it usable behind a load balancer.
-		etag := `"` + hex.EncodeToString(snapshot.StateVector) + `"`
+		body := snapshot.Update
+		contentType := "application/octet-stream"
+		if asJSON {
+			view, err := describe(name, snapshot)
+			if err != nil {
+				log.Error("could not render document", "document", name, "err", err)
+				http.Error(w, "could not read the document", http.StatusInternalServerError)
+				return
+			}
+			body, err = json.Marshal(view)
+			if err != nil {
+				log.Error("could not render document", "document", name, "err", err)
+				http.Error(w, "could not read the document", http.StatusInternalServerError)
+				return
+			}
+			body = append(body, '\n') // Preserve Encoder.Encode's existing response newline.
+			contentType = "application/json"
+		}
+		digest := sha256.Sum256(body)
+		etag := `"` + hex.EncodeToString(digest[:]) + `"`
 		w.Header().Set(headerStateVector, base64.StdEncoding.EncodeToString(snapshot.StateVector))
 		w.Header().Set(headerResident, boolString(snapshot.Resident))
 		w.Header().Set("ETag", etag)
+		w.Header().Add("Vary", "Accept")
+		w.Header().Set("Content-Type", contentType)
 		// A document is not a public resource and the answer depends on who is
 		// asking for what; caching it in a shared proxy is not something this
 		// server should invite.
@@ -100,22 +119,7 @@ func getDocument(manager *room.Manager, documents room.Persistence, log *slog.Lo
 			return
 		}
 
-		if !asJSON {
-			w.Header().Set("Content-Type", "application/octet-stream")
-			if _, err := w.Write(snapshot.Update); err != nil {
-				log.Debug("could not write document", "document", name, "err", err)
-			}
-			return
-		}
-
-		body, err := describe(name, snapshot)
-		if err != nil {
-			log.Error("could not render document", "document", name, "err", err)
-			http.Error(w, "could not read the document", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(body); err != nil {
+		if _, err := w.Write(body); err != nil {
 			log.Debug("could not write document", "document", name, "err", err)
 		}
 	}

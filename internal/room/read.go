@@ -34,7 +34,7 @@ type Snapshot struct {
 	// carried no state vector, or the difference from it when it did.
 	Update []byte
 	// StateVector is what the document knows, whatever Update contains. It is
-	// the version a caller compares against, and what the ETag is built from.
+	// sync metadata; HTTP ETags validate the selected response representation.
 	StateVector []byte
 	// Clients is how many connections this node has on the document, and -1
 	// when it was read from the database rather than from a room.

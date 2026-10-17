@@ -33,9 +33,8 @@ type Version struct {
 	ID int64
 	// CreatedAt is when it was taken.
 	CreatedAt time.Time
-	// StateVector is the document's version at that moment. It is the same
-	// bytes the read API returns as an ETag, so a caller can tell whether a
-	// version matches what it already has without downloading it.
+	// StateVector is the document's sync version at that moment. It does not
+	// include deletion-only changes and is not an HTTP representation ETag.
 	StateVector []byte
 	// Label is empty for the versions the timer took, and whatever the caller
 	// said for the ones taken by hand.
