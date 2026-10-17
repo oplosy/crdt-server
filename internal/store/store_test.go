@@ -5,10 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/mesutokul/ycollab/internal/crdt"
 	"github.com/mesutokul/ycollab/internal/store"
 )
 
@@ -38,6 +42,19 @@ func testStore(t *testing.T) *store.Store {
 	}
 	t.Cleanup(s.Close)
 	return s
+}
+
+func compactCurrent(t *testing.T, s *store.Store, ctx context.Context, id store.UUID, snapshot []byte, folded []int64) error {
+	t.Helper()
+	doc, err := s.LoadAny(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !doc.Exists {
+		return errors.New("document does not exist")
+	}
+	_, err = s.Compact(ctx, id, doc.Owner, doc.Incarnation, doc.SnapshotGeneration, snapshot, folded)
+	return err
 }
 
 // Each test gets its own document, so tests do not interfere and none of them
@@ -71,6 +88,69 @@ func TestLoadCreatesAnEmptyDocument(t *testing.T) {
 	// to a document does it.
 	if _, err := s.Load(c, id, "", store.NilUUID); err != nil {
 		t.Fatalf("second load: %v", err)
+	}
+}
+
+func TestConcurrentMigrateOnCleanSchema(t *testing.T) {
+	dbURL := os.Getenv(dbEnv)
+	if dbURL == "" {
+		t.Skipf("%s is not set; start deploy/docker-compose.yml to run these", dbEnv)
+	}
+	c := ctx(t)
+	admin, err := pgx.Connect(c, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	schemaName := fmt.Sprintf("migrate_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(c, `CREATE SCHEMA `+schemaName); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(context.Background(), `DROP SCHEMA `+schemaName+` CASCADE`)
+
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := u.Query()
+	query.Set("search_path", schemaName)
+	u.RawQuery = query.Encode()
+
+	stores := make([]*store.Store, 2)
+	for i := range stores {
+		stores[i], err = store.Open(c, u.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stores[i].Close()
+	}
+	start := make(chan struct{})
+	errs := make(chan error, len(stores))
+	for _, s := range stores {
+		go func(s *store.Store) {
+			<-start
+			errs <- s.Migrate(c)
+		}(s)
+	}
+	close(start)
+	for range stores {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent Migrate: %v", err)
+		}
+	}
+
+	isolated, err := pgx.Connect(c, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer isolated.Close(context.Background())
+	var documents, incarnationSeq bool
+	if err := isolated.QueryRow(c, `SELECT to_regclass('documents') IS NOT NULL,
+		to_regclass('document_incarnation_seq') IS NOT NULL`).Scan(&documents, &incarnationSeq); err != nil {
+		t.Fatal(err)
+	}
+	if !documents || !incarnationSeq {
+		t.Fatalf("clean schema migration left documents=%v incarnation_seq=%v", documents, incarnationSeq)
 	}
 }
 
@@ -135,7 +215,7 @@ func TestCompactFoldsTheLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(c, id, []byte("snapshot-1"), folded); err != nil {
+	if err := compactCurrent(t, s, c, id, []byte("snapshot-1"), folded); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
 
@@ -172,7 +252,7 @@ func TestCompactKeepsUpdatesAboveTheWatermark(t *testing.T) {
 	if _, err := s.Append(c, id, [][]byte{[]byte("in flight")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(c, id, []byte("snapshot"), folded); err != nil {
+	if err := compactCurrent(t, s, c, id, []byte("snapshot"), folded); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
 
@@ -204,10 +284,14 @@ func TestCompactRefusesToGoBackwards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.Compact(c, id, []byte("newer"), append(first, second...)); err != nil {
+	base, err := s.LoadAny(c, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Compact(c, id, base.Owner, base.Incarnation, base.SnapshotGeneration, []byte("newer"), append(first, second...)); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	err = s.Compact(c, id, []byte("older"), first)
+	_, err = s.Compact(c, id, base.Owner, base.Incarnation, base.SnapshotGeneration, []byte("older"), first)
 	if !errors.Is(err, store.ErrStaleSnapshot) {
 		t.Fatalf("got %v, want ErrStaleSnapshot", err)
 	}
@@ -221,6 +305,107 @@ func TestCompactRefusesToGoBackwards(t *testing.T) {
 	}
 	if doc.SnapshotSeq != second[0] {
 		t.Fatalf("snapshot_seq went backwards: %d", doc.SnapshotSeq)
+	}
+}
+
+// Two replicas can hold different valid Yjs states. A snapshot based on an
+// older state must not overwrite another replica's newer snapshot merely
+// because its own update has a higher seq.
+func TestCompactPreservesConcurrentReplicaUpdates(t *testing.T) {
+	s := testStore(t)
+	c := ctx(t)
+	id := testDoc(t)
+	if _, err := s.Load(c, id, "", store.NilUUID); err != nil {
+		t.Fatal(err)
+	}
+
+	update := func(name string) []byte {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "fixtures", "text-three-client-interleaved", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	x, y, z := update("update-000.bin"), update("update-003.bin"), update("update-006.bin")
+
+	if _, err := s.Append(c, id, [][]byte{x}); err != nil {
+		t.Fatal(err)
+	}
+	a := crdt.NewDoc(0)
+	loaded, err := s.Load(c, id, "", store.NilUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Snapshot != nil {
+		if err := a.ApplyUpdate(loaded.Snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, payload := range loaded.Updates {
+		if err := a.ApplyUpdate(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	b := crdt.NewDoc(0)
+	if loaded.Snapshot != nil {
+		if err := b.ApplyUpdate(loaded.Snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, payload := range loaded.Updates {
+		if err := b.ApplyUpdate(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.ApplyUpdate(y); err != nil {
+		t.Fatal(err)
+	}
+	ySeqs, err := s.Append(c, id, [][]byte{y})
+	if err != nil {
+		t.Fatal(err)
+	}
+	xy, err := b.EncodeStateAsUpdate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Compact(c, id, loaded.Owner, loaded.Incarnation, loaded.SnapshotGeneration, xy, append(append([]int64(nil), loaded.Seqs...), ySeqs...)); err != nil {
+		t.Fatalf("replica B compact: %v", err)
+	}
+
+	if err := a.ApplyUpdate(z); err != nil {
+		t.Fatal(err)
+	}
+	zSeqs, err := s.Append(c, id, [][]byte{z})
+	if err != nil {
+		t.Fatal(err)
+	}
+	xz, err := a.EncodeStateAsUpdate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Compact(c, id, loaded.Owner, loaded.Incarnation, loaded.SnapshotGeneration, xz, append(append([]int64(nil), loaded.Seqs...), zSeqs...)); !errors.Is(err, store.ErrStaleSnapshot) {
+		t.Fatalf("stale replica A compact: got %v, want ErrStaleSnapshot", err)
+	}
+
+	stored, err := s.Load(c, id, "", store.NilUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := crdt.NewDoc(0)
+	if stored.Snapshot != nil {
+		if err := restored.ApplyUpdate(stored.Snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, payload := range stored.Updates {
+		if err := restored.ApplyUpdate(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := restored.Text("text").String(), "zeroonethree"; got != want {
+		t.Fatalf("reloaded text %q, want merged X/Y/Z state %q", got, want)
 	}
 }
 
@@ -240,7 +425,14 @@ func TestCompactIsAtomicForReaders(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- s.Compact(c, id, []byte("snapshot"), folded) }()
+	base, err := s.LoadAny(c, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, err := s.Compact(c, id, base.Owner, base.Incarnation, base.SnapshotGeneration, []byte("snapshot"), folded)
+		done <- err
+	}()
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -289,7 +481,7 @@ func TestCompactOnlyDeletesTheRowsItFolded(t *testing.T) {
 
 	// The snapshot covers only the later row, standing in for a row that was
 	// still invisible when the snapshot was taken but has a lower seq.
-	if err := s.Compact(c, id, []byte("snapshot"), late); err != nil {
+	if err := compactCurrent(t, s, c, id, []byte("snapshot"), late); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
 
@@ -308,6 +500,57 @@ func TestCompactOnlyDeletesTheRowsItFolded(t *testing.T) {
 		t.Fatalf("this test proves nothing unless snapshot_seq (%d) is above the surviving row (%d)",
 			doc.SnapshotSeq, early[0])
 	}
+	firstGeneration := doc.SnapshotGeneration
+	if err := compactCurrent(t, s, c, id, []byte("snapshot includes the late row"), doc.Seqs); err != nil {
+		t.Fatalf("compact the lower-seq row at the same watermark: %v", err)
+	}
+	doc, err = s.Load(c, id, "", store.NilUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.SnapshotSeq != late[0] || doc.SnapshotGeneration != firstGeneration+1 {
+		t.Fatalf("same-watermark compaction has seq/generation %d/%d, want %d/%d",
+			doc.SnapshotSeq, doc.SnapshotGeneration, late[0], firstGeneration+1)
+	}
+	if len(doc.Updates) != 0 {
+		t.Fatalf("same-watermark compaction left %d folded rows", len(doc.Updates))
+	}
+}
+
+func TestCompactCannotCrossDocumentRecreation(t *testing.T) {
+	s := testStore(t)
+	c := ctx(t)
+	id := testDoc(t)
+	if _, err := s.Load(c, id, "", store.NilUUID); err != nil {
+		t.Fatal(err)
+	}
+	old, err := s.LoadAny(c, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := s.Delete(c, id); err != nil || !deleted {
+		t.Fatalf("delete: deleted=%v err=%v", deleted, err)
+	}
+	if _, err := s.Ensure(c, id, "", store.NilUUID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.LoadAny(c, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.Exists || current.Incarnation == old.Incarnation {
+		t.Fatalf("recreated row incarnation %d, old incarnation %d", current.Incarnation, old.Incarnation)
+	}
+	if _, err := s.Compact(c, id, old.Owner, old.Incarnation, old.SnapshotGeneration, []byte("stale"), []int64{1}); !errors.Is(err, store.ErrStaleSnapshot) {
+		t.Fatalf("stale compact got %v, want ErrStaleSnapshot", err)
+	}
+	current, err = s.LoadAny(c, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Snapshot != nil || len(current.Updates) != 0 {
+		t.Fatalf("stale compact changed recreated document: %+v", current)
+	}
 }
 
 // Compacting with nothing to fold is a no-op rather than a snapshot that
@@ -319,7 +562,7 @@ func TestCompactWithNothingFoldedIsANoOp(t *testing.T) {
 	if _, err := s.Load(c, id, "", store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Compact(c, id, []byte("snapshot"), nil); err != nil {
+	if err := compactCurrent(t, s, c, id, []byte("snapshot"), nil); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
 	doc, err := s.Load(c, id, "", store.NilUUID)

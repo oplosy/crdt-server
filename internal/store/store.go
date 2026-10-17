@@ -81,9 +81,21 @@ func Open(ctx context.Context, url string) (*Store, error) {
 func (s *Store) Close() { s.pool.Close() }
 
 // Migrate creates the schema if it is not there. It is idempotent, so it can
-// run on every boot.
+// run on every boot. The transaction-scoped lock serializes startup across
+// replicas before any DDL runs, including creation of shared sequences.
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, schema); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('ycollab:schema-migrate', 0))`); err != nil {
+		return fmt.Errorf("store: migrate lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schema); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
 	return nil
@@ -153,6 +165,15 @@ func ensureIn(ctx context.Context, tx pgx.Tx, id UUID, name string, owner UUID) 
 // A Document is what was on disk: a snapshot, possibly empty, and the log rows
 // that came after it.
 type Document struct {
+	// Exists distinguishes a missing LoadAny result from a newly created but
+	// otherwise empty document.
+	Exists bool
+	// Incarnation is stable for a row's lifetime and changes after delete and
+	// recreation. Legacy rows migrated from older schemas have token zero.
+	Incarnation int64
+	// SnapshotGeneration advances on every successful compaction, even when
+	// snapshot_seq does not move.
+	SnapshotGeneration int64
 	// Snapshot is a full Yjs update, or nil for a document that has never been
 	// compacted.
 	Snapshot []byte
@@ -189,11 +210,13 @@ func (s *Store) Load(ctx context.Context, id UUID, name string, owner UUID) (*Do
 // LoadAny reads a document without checking who owns it, and without creating
 // it.
 //
-// Two differences from Load, both deliberate. It is above the tenancy boundary,
-// for the administrative surface, which serves an operator rather than a tenant
-// and can already delete any document; it is a separate method rather than a
-// flag so that reading past the boundary is a call somebody can grep for, and so
-// no call site can do it by leaving a parameter at its zero value.
+// Two differences from Load, both deliberate. It is used by the administrative
+// read surface, which serves an operator rather than a tenant and can already
+// delete any document. The compaction writer also uses it to rebase against
+// persisted state, and explicitly checks owner and immutable incarnation before
+// merging. It is a separate method rather than a flag so that reading past the
+// tenancy boundary is a call somebody can grep for, and so no call site can do
+// it by leaving a parameter at its zero value.
 //
 // And it never creates the row. Load creates one because opening a document is
 // how a document comes to exist. A read is not: a read of a name nothing has
@@ -226,8 +249,11 @@ func (s *Store) load(ctx context.Context, id UUID, name string, owner UUID, any 
 	var codec pack.Codec
 	var key string
 	if err := tx.QueryRow(ctx,
-		`SELECT snapshot, snapshot_codec, snapshot_key, snapshot_seq, owner_id FROM documents WHERE id = $1`, id,
-	).Scan(&doc.Snapshot, &codec, &key, &doc.SnapshotSeq, &doc.Owner); err != nil {
+		`SELECT snapshot, snapshot_codec, snapshot_key, snapshot_seq, owner_id,
+		        snapshot_generation, incarnation
+		   FROM documents WHERE id = $1 FOR SHARE`, id,
+	).Scan(&doc.Snapshot, &codec, &key, &doc.SnapshotSeq, &doc.Owner,
+		&doc.SnapshotGeneration, &doc.Incarnation); err != nil {
 		if any && errors.Is(err, pgx.ErrNoRows) {
 			// Nothing here, and nothing created. The caller turns this into
 			// "no such document"; an empty Document would be a lie that reads
@@ -236,6 +262,7 @@ func (s *Store) load(ctx context.Context, id UUID, name string, owner UUID, any 
 		}
 		return nil, fmt.Errorf("store: read document: %w", err)
 	}
+	doc.Exists = true
 	if doc.Snapshot != nil || key != "" {
 		if doc.Snapshot, err = s.readBlob(ctx, key, doc.Snapshot, codec); err != nil {
 			return nil, fmt.Errorf("store: read snapshot: %w", err)
@@ -308,7 +335,9 @@ func (s *Store) Append(ctx context.Context, id UUID, payloads [][]byte) ([]int64
 }
 
 // Compact replaces the snapshot and deletes exactly the log rows it covers, in
-// one transaction. folded lists the seqs the snapshot contains.
+// one transaction, only if the document incarnation and snapshot generation
+// still match the caller's coherent load. folded lists the seqs the snapshot
+// contains.
 //
 // The delete names its rows rather than deleting a range. A range would be
 // wrong: seq comes from an identity column, and identity values are handed out
@@ -322,16 +351,17 @@ func (s *Store) Append(ctx context.Context, id UUID, payloads [][]byte) ([]int64
 //
 //   - an advisory lock serialises compaction of one document, so two replicas
 //     cannot interleave their snapshot write and their delete;
-//   - the write only lands if it moves snapshot_seq forward, so an older
-//     snapshot cannot overwrite a newer one. That returns ErrStaleSnapshot and
-//     changes nothing.
+//   - the compare-and-swap checks a real snapshot generation, not the maximum
+//     covered seq: late lower-seq rows can require a replacement at the same
+//     watermark. The incarnation check prevents stale work crossing delete and
+//     recreation, even for the same owner.
 //
 // See DECISIONS C2 and C6.
-func (s *Store) Compact(ctx context.Context, id UUID, snapshot []byte, folded []int64) error {
+func (s *Store) Compact(ctx context.Context, id, owner UUID, incarnation, generation int64, snapshot []byte, folded []int64) (int64, error) {
 	if len(folded) == 0 {
 		// Nothing has been written since the last snapshot, so a new one would
 		// say nothing the old one does not.
-		return nil
+		return generation, nil
 	}
 	var watermark int64
 	for _, seq := range folded {
@@ -342,12 +372,12 @@ func (s *Store) Compact(ctx context.Context, id UUID, snapshot []byte, folded []
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("store: compact: %w", err)
+		return generation, fmt.Errorf("store: compact: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, id); err != nil {
-		return fmt.Errorf("store: compact lock: %w", err)
+		return generation, fmt.Errorf("store: compact lock: %w", err)
 	}
 
 	// Compressed here rather than by the caller: the room hands over the
@@ -362,14 +392,16 @@ func (s *Store) Compact(ctx context.Context, id UUID, snapshot []byte, folded []
 	// future reader of this document; this order leaves, at worst, an object
 	// nothing points at. See blobs.go.
 	//
-	// It is written before the transaction below rather than inside it, because
-	// an object write is a network round trip and holding the document's
-	// advisory lock across one would block every other replica compacting it.
-	// The key carries the sequence number, so two replicas racing here write two
-	// different objects and the row decides which one counts.
-	key, err := s.putBlob(ctx, snapshotKey(id, watermark), packed)
+	// A unique key per attempt keeps competing and retried compactions from
+	// overwriting an object another committed row may name. This PUT currently
+	// occurs while the transaction and document advisory lock are held.
+	keyName, err := uniqueSnapshotKey(id)
 	if err != nil {
-		return fmt.Errorf("store: write snapshot: %w", err)
+		return generation, err
+	}
+	key, err := s.putBlob(ctx, keyName, packed)
+	if err != nil {
+		return generation, fmt.Errorf("store: write snapshot: %w", err)
 	}
 	// Recorded before the column is emptied, because afterwards nothing on this
 	// side knows how big the snapshot was. It is the stored size - what the
@@ -387,24 +419,28 @@ func (s *Store) Compact(ctx context.Context, id UUID, snapshot []byte, folded []
 	var superseded string
 	if err := tx.QueryRow(ctx,
 		`SELECT snapshot_key FROM documents WHERE id = $1`, id).Scan(&superseded); err != nil {
-		return fmt.Errorf("store: read the previous snapshot key: %w", err)
+		return generation, fmt.Errorf("store: read the previous snapshot key: %w", err)
 	}
 
-	tag, err := tx.Exec(ctx,
+	var nextGeneration int64
+	err = tx.QueryRow(ctx,
 		`UPDATE documents
 		    SET snapshot = $2, snapshot_codec = $4, snapshot_key = $5,
-		        snapshot_bytes = $6, snapshot_seq = $3, updated_at = now()
-		  WHERE id = $1 AND snapshot_seq < $3`,
-		id, packed, watermark, codec, key, stored)
+		        snapshot_bytes = $6, snapshot_seq = GREATEST(snapshot_seq, $3),
+		        snapshot_generation = snapshot_generation + 1, updated_at = now()
+		  WHERE id = $1 AND owner_id = $7 AND incarnation = $8 AND snapshot_generation = $9
+		RETURNING snapshot_generation`,
+		id, packed, watermark, codec, key, stored, owner, incarnation, generation).Scan(&nextGeneration)
 	if err != nil {
-		return fmt.Errorf("store: write snapshot: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		// Somebody else got there with a newer snapshot. Our object is now an
-		// orphan, and this is the one case where it can be cleaned up at once:
-		// no row ever named it.
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Somebody else got there with a newer snapshot. Our object is now an
+			// orphan, and this is the one case where it can be cleaned up at once:
+			// no row ever named it.
+			s.dropBlob(ctx, key)
+			return generation, ErrStaleSnapshot
+		}
 		s.dropBlob(ctx, key)
-		return ErrStaleSnapshot
+		return generation, fmt.Errorf("store: write snapshot: %w", err)
 	}
 
 	// Anything not named here survives, including updates that arrived while
@@ -412,13 +448,14 @@ func (s *Store) Compact(ctx context.Context, id UUID, snapshot []byte, folded []
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM doc_updates WHERE doc_id = $1 AND seq = ANY($2)`, id, folded,
 	); err != nil {
-		return fmt.Errorf("store: prune log: %w", err)
+		s.dropBlob(ctx, key)
+		return generation, fmt.Errorf("store: prune log: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		// The object we wrote is now an orphan: nothing committed names it.
-		s.dropBlob(ctx, key)
-		return fmt.Errorf("store: compact: %w", err)
+		// Commit may have succeeded even if its response was lost. Keep this
+		// immutable object: deleting it could break a committed row.
+		return generation, fmt.Errorf("store: compact: %w", err)
 	}
 	// The row now names the new object, so the old one is safe to remove. After
 	// the commit, never before: a crash in between leaves an orphan, and the
@@ -426,7 +463,7 @@ func (s *Store) Compact(ctx context.Context, id UUID, snapshot []byte, folded []
 	if superseded != "" && superseded != key {
 		s.dropBlob(ctx, superseded)
 	}
-	return nil
+	return nextGeneration, nil
 }
 
 // Delete removes a document and its log. It reports whether there was one.
@@ -435,16 +472,17 @@ func (s *Store) Compact(ctx context.Context, id UUID, snapshot []byte, folded []
 // one statement and cannot leave orphaned updates behind.
 //
 // A room on another replica can outlive this call - DELETE evicts the room on
-// the replica that served it and tells no other - and its next write cannot
-// bring the document back. Append's foreign key has no parent to point at, and
-// Compact only ever updates a row it expects to find. Both fail loudly and are
-// counted; the document stays gone. See the test that holds this.
+// the replica that served it and tells no other. Append fails while the row is
+// absent. The compaction writer detects a missing or changed incarnation and
+// stops compacting that stale room; its Append/version operations are not fenced
+// from a later recreation. See the tests for delete and recreation behavior.
 //
 // What is lost is what those clients typed between the delete and their room's
 // eviction, which is the honest cost of deleting a document somebody else is
 // still editing. With object storage on, the failed compaction has already
-// written its snapshot object by then, and nothing will ever name it: one
-// orphan per attempt, bounded by the key carrying its sequence number.
+// written its snapshot object by then, and nothing will ever name it. The
+// unique attempt key prevents it from replacing the recreated document's
+// snapshot; orphan cleanup remains an operational task.
 func (s *Store) Delete(ctx context.Context, id UUID) (bool, error) {
 	// The keys are collected before the rows go, because after the cascade
 	// nothing remembers which objects this document owned.

@@ -202,6 +202,9 @@ type Room struct {
 	aw    *protocol.Awareness
 	docID store.UUID
 	owner store.UUID
+	// incarnation is fixed at load and checked before every rebase, so an old
+	// room never merges its state into a recreated document.
+	incarnation int64
 	// usage is what the document costs, measured on the tick and published for
 	// the manager's memory budget. See memory.go.
 	usage usage

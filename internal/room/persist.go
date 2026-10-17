@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/mesutokul/ycollab/internal/crdt"
 	"github.com/mesutokul/ycollab/internal/metrics"
 	"github.com/mesutokul/ycollab/internal/store"
 )
@@ -17,9 +18,9 @@ type Persistence interface {
 	// row if this is the first time anybody asked. It refuses with
 	// store.ErrWrongOwner if the row exists and belongs to somebody else.
 	Load(ctx context.Context, id store.UUID, name string, owner store.UUID) (*store.Document, error)
-	// LoadAny reads without checking the owner and without creating the row.
-	// It is for the administrative surface, which is above tenancy; every call
-	// site is on that listener and is audited.
+	// LoadAny reads without creating the row. The compaction writer uses it to
+	// rebase against persisted state, and checks owner and incarnation before
+	// merging; the administrative read path also uses it above tenancy.
 	LoadAny(ctx context.Context, id store.UUID) (*store.Document, error)
 	// Ensure creates the document row and reports who owns it. Import needs it
 	// because a restore writes to the log without reading first, and the log's
@@ -27,7 +28,7 @@ type Persistence interface {
 	// document before a room exists.
 	Ensure(ctx context.Context, id store.UUID, name string, owner store.UUID) (store.UUID, error)
 	Append(ctx context.Context, id store.UUID, payloads [][]byte) ([]int64, error)
-	Compact(ctx context.Context, id store.UUID, snapshot []byte, folded []int64) error
+	Compact(ctx context.Context, id, owner store.UUID, incarnation, generation int64, snapshot []byte, folded []int64) (int64, error)
 }
 
 // Versioning is the part of internal/store a room needs to keep history. It is
@@ -79,6 +80,7 @@ func (r *Room) load(ctx context.Context) error {
 		r.metrics.StoreFailed.WithLabelValues("load").Inc()
 		return err
 	}
+	r.incarnation = doc.Incarnation
 	defer func() { metrics.Observe(r.metrics.LoadDuration, started) }()
 	metrics.Observe(r.metrics.StoreDuration.WithLabelValues("load"), started)
 	if doc.Snapshot != nil {
@@ -158,6 +160,11 @@ func (r *Room) requestCompaction() {
 	if r.jobs == nil {
 		return
 	}
+	if r.doc.PendingCount() > 0 {
+		// EncodeStateAsUpdate omits pending structs. Leave the threshold crossed
+		// so a later update can request a snapshot after dependencies arrive.
+		return
+	}
 	snapshot, err := r.doc.EncodeStateAsUpdate(nil)
 	if err != nil {
 		r.log.Error("encode snapshot", "err", err)
@@ -180,12 +187,13 @@ func (r *Room) persist(jobs <-chan persistJob) {
 	defer close(r.persistDone)
 
 	var batch [][]byte
+	var pendingSnapshot []byte
 	// waiters are the durable-write jobs in the current batch; each is released
 	// once the batch is on disk, whether the write succeeded or not - a caller
 	// that waited forever on a database that is down would take the document
 	// with it, and the error is already logged loudly.
 	var waiters []chan struct{}
-	flush := func() {
+	flush := func() bool {
 		defer func() {
 			for _, done := range waiters {
 				close(done)
@@ -193,7 +201,7 @@ func (r *Room) persist(jobs <-chan persistJob) {
 			waiters = waiters[:0]
 		}()
 		if len(batch) == 0 {
-			return
+			return false
 		}
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
@@ -205,6 +213,8 @@ func (r *Room) persist(jobs <-chan persistJob) {
 			// The updates stay in memory and in every connected client. Say so
 			// loudly rather than pretending the write happened.
 			r.log.Error("could not write updates", "count", len(batch), "err", err)
+			batch = batch[:0]
+			return false
 		} else {
 			r.folded = append(r.folded, seqs...)
 			// The store event is raised here rather than in the room goroutine
@@ -215,6 +225,12 @@ func (r *Room) persist(jobs <-chan persistJob) {
 			r.stored(len(batch))
 		}
 		batch = batch[:0]
+		return true
+	}
+	retryPending := func() {
+		if pendingSnapshot != nil && r.compact(pendingSnapshot) {
+			pendingSnapshot = nil
+		}
 	}
 
 	// In durable-write mode every job flushes itself, so the timer only exists
@@ -230,6 +246,7 @@ func (r *Room) persist(jobs <-chan persistJob) {
 		case job, ok := <-jobs:
 			if !ok {
 				flush()
+				retryPending()
 				return
 			}
 			if job.version != nil {
@@ -244,7 +261,8 @@ func (r *Room) persist(jobs <-chan persistJob) {
 				// disk first, or the watermark would cover rows that are not
 				// there yet.
 				flush()
-				r.compact(job.snapshot)
+				pendingSnapshot = append(pendingSnapshot[:0], job.snapshot...)
+				retryPending()
 				continue
 			}
 			batch = append(batch, job.payload)
@@ -255,40 +273,105 @@ func (r *Room) persist(jobs <-chan persistJob) {
 			// waiting for it: durable writes are a promise about this update, not
 			// about the next one.
 			if len(batch) >= maxBatch || len(waiters) > 0 {
-				flush()
+				if flush() {
+					retryPending()
+				}
 			}
 		case <-ticker.C:
-			flush()
+			if flush() {
+				retryPending()
+			}
 		}
 	}
 }
 
-func (r *Room) compact(snapshot []byte) {
+// compact re-reads and unions persisted state with the immutable actor
+// snapshot. The persist goroutine never touches the live actor Doc.
+func (r *Room) compact(snapshot []byte) bool {
 	if len(r.folded) == 0 {
-		return
+		return true
 	}
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
-	err := r.cfg.Store.Compact(ctx, r.docID, snapshot, r.folded)
-	metrics.Observe(r.metrics.StoreDuration.WithLabelValues("compact"), started)
-	switch {
-	case err == nil:
+	defer func() { metrics.Observe(r.metrics.StoreDuration.WithLabelValues("compact"), started) }()
+
+	for attempt := 0; attempt < 3; attempt++ {
+		doc, err := r.cfg.Store.LoadAny(ctx, r.docID)
+		if err != nil {
+			r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+			r.log.Error("could not reload document for compaction", "err", err)
+			return false
+		}
+		if !doc.Exists || doc.Owner != r.owner || doc.Incarnation != r.incarnation {
+			// A room may outlive deletion. Never merge its in-memory state into a
+			// missing or recreated document, even when the owner is unchanged.
+			r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+			r.log.Warn("stopped compaction because the document incarnation changed")
+			return true
+		}
+
+		merged := crdt.NewDoc(0)
+		if doc.Snapshot != nil {
+			if err := merged.ApplyUpdate(doc.Snapshot); err != nil {
+				r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+				r.log.Error("could not apply persisted snapshot for compaction", "err", err)
+				return false
+			}
+		}
+		for _, update := range doc.Updates {
+			if err := merged.ApplyUpdate(update); err != nil {
+				r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+				r.log.Error("could not apply persisted update for compaction", "err", err)
+				return false
+			}
+		}
+		if err := merged.ApplyUpdate(snapshot); err != nil {
+			r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+			r.log.Error("could not apply actor snapshot for compaction", "err", err)
+			return false
+		}
+		if merged.PendingCount() > 0 {
+			// Pending structs are not encoded into full-state updates. Keep the
+			// candidate and all rows until a later append resolves dependencies.
+			return false
+		}
+		mergedSnapshot, err := merged.EncodeStateAsUpdate(nil)
+		if err != nil {
+			r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+			r.log.Error("could not encode merged snapshot", "err", err)
+			return false
+		}
+
+		folded := append([]int64(nil), doc.Seqs...)
+		seen := make(map[int64]struct{}, len(folded)+len(r.folded))
+		for _, seq := range folded {
+			seen[seq] = struct{}{}
+		}
+		for _, seq := range r.folded {
+			if _, ok := seen[seq]; !ok {
+				folded = append(folded, seq)
+				seen[seq] = struct{}{}
+			}
+		}
+		_, err = r.cfg.Store.Compact(ctx, r.docID, doc.Owner, doc.Incarnation,
+			doc.SnapshotGeneration, mergedSnapshot, folded)
+		if errors.Is(err, store.ErrStaleSnapshot) {
+			continue
+		}
+		if err != nil {
+			r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+			r.log.Error("could not compact", "err", err)
+			return false
+		}
 		r.metrics.Compactions.Inc()
-		r.log.Info("compacted", "rows", len(r.folded), "snapshot", len(snapshot))
-		// Those rows are gone; a later snapshot must not try to delete them
-		// again, and must not claim to cover them.
+		r.log.Info("compacted", "rows", len(folded), "snapshot", len(mergedSnapshot))
 		r.folded = r.folded[:0]
-	case errors.Is(err, store.ErrStaleSnapshot):
-		// Another replica got there first with a newer snapshot, which contains
-		// everything ours does. Our rows are covered by theirs, so drop them.
-		r.log.Info("skipped compaction, a newer snapshot exists")
-		r.folded = r.folded[:0]
-	default:
-		// Keep the rows: the next compaction should still cover them.
-		r.metrics.StoreFailed.WithLabelValues("compact").Inc()
-		r.log.Error("could not compact", "err", err)
+		return true
 	}
+	r.metrics.StoreFailed.WithLabelValues("compact").Inc()
+	r.log.Warn("could not compact after repeated generation conflicts")
+	return false
 }
 
 // abandonPersisting gives up on writing anything, for the case where the room
