@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/mesutokul/ycollab/internal/crdt"
 	"github.com/mesutokul/ycollab/internal/store"
 )
@@ -86,6 +88,69 @@ func TestLoadCreatesAnEmptyDocument(t *testing.T) {
 	// to a document does it.
 	if _, err := s.Load(c, id, "", store.NilUUID); err != nil {
 		t.Fatalf("second load: %v", err)
+	}
+}
+
+func TestConcurrentMigrateOnCleanSchema(t *testing.T) {
+	dbURL := os.Getenv(dbEnv)
+	if dbURL == "" {
+		t.Skipf("%s is not set; start deploy/docker-compose.yml to run these", dbEnv)
+	}
+	c := ctx(t)
+	admin, err := pgx.Connect(c, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	schemaName := fmt.Sprintf("migrate_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(c, `CREATE SCHEMA `+schemaName); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(context.Background(), `DROP SCHEMA `+schemaName+` CASCADE`)
+
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := u.Query()
+	query.Set("search_path", schemaName)
+	u.RawQuery = query.Encode()
+
+	stores := make([]*store.Store, 2)
+	for i := range stores {
+		stores[i], err = store.Open(c, u.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stores[i].Close()
+	}
+	start := make(chan struct{})
+	errs := make(chan error, len(stores))
+	for _, s := range stores {
+		go func(s *store.Store) {
+			<-start
+			errs <- s.Migrate(c)
+		}(s)
+	}
+	close(start)
+	for range stores {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent Migrate: %v", err)
+		}
+	}
+
+	isolated, err := pgx.Connect(c, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer isolated.Close(context.Background())
+	var documents, incarnationSeq bool
+	if err := isolated.QueryRow(c, `SELECT to_regclass('documents') IS NOT NULL,
+		to_regclass('document_incarnation_seq') IS NOT NULL`).Scan(&documents, &incarnationSeq); err != nil {
+		t.Fatal(err)
+	}
+	if !documents || !incarnationSeq {
+		t.Fatalf("clean schema migration left documents=%v incarnation_seq=%v", documents, incarnationSeq)
 	}
 }
 

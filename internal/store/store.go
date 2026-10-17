@@ -81,9 +81,21 @@ func Open(ctx context.Context, url string) (*Store, error) {
 func (s *Store) Close() { s.pool.Close() }
 
 // Migrate creates the schema if it is not there. It is idempotent, so it can
-// run on every boot.
+// run on every boot. The transaction-scoped lock serializes startup across
+// replicas before any DDL runs, including creation of shared sequences.
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, schema); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('ycollab:schema-migrate', 0))`); err != nil {
+		return fmt.Errorf("store: migrate lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schema); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
 	return nil
