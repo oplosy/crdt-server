@@ -8,7 +8,7 @@
 # GOARCH instead of emulating an arm64 toolchain under QEMU, which is the
 # difference between a two-minute multi-architecture build and a twenty-minute
 # one. Go cross-compiles for free; there is no reason to pay for emulation.
-FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine AS build
 WORKDIR /src
 
 # Dependencies first, so editing Go files does not re-download the module graph.

@@ -1,7 +1,7 @@
 package store_test
 
 // Snapshots and versions in object storage, against a real PostgreSQL and a real
-// MinIO.
+// S3-compatible storage.
 //
 // The tests that earn their place are the ones about the boundary between the
 // two systems: that a row and the object it names agree, that a database holding
@@ -69,7 +69,7 @@ func (r *recordingBlobs) deleted(key string) bool {
 	return false
 }
 
-// blobStore returns a store writing its blobs to MinIO, and the wrapper so a
+// blobStore returns a store writing its blobs to S3, and the wrapper so a
 // test can see and interfere with what it does.
 func blobStore(t *testing.T) (*store.Store, *recordingBlobs, context.Context) {
 	t.Helper()

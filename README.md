@@ -330,7 +330,7 @@ than an SDK: no IRSA, no EC2 instance roles, no SSO, no shared config file. Keys
 come from the flags or from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
 `AWS_SESSION_TOKEN` — on Kubernetes, a Secret rather than a service account
 annotation. No multipart upload, so a single object is capped at S3's 5 GB. The
-signing is checked against a real MinIO in the test suite, not against a mock that
+signing is checked against a real S3-compatible service in the test suite, not against a mock that
 would agree with its own mistakes.
 
 ### The audit trail
@@ -802,18 +802,23 @@ go test ./... -race
 ```
 
 Some tests need real infrastructure and skip without it. All three come up together:
+Creating the test bucket also requires AWS CLI v2.
+Compose stores RustFS data in Docker's anonymous volume, which survives a stop and restart.
 
 ```sh
 docker compose -f deploy/docker-compose.yml up -d
-docker exec deploy-minio-1 mc alias set local http://127.0.0.1:9000 ycollab ycollab-secret
-docker exec deploy-minio-1 mc mb --ignore-existing local/ycollab
+for _ in $(seq 30); do curl -fsS http://127.0.0.1:9002/health/ready >/dev/null && break; sleep 1; done
+curl -fsS http://127.0.0.1:9002/health/ready >/dev/null
+export AWS_ACCESS_KEY_ID=ycollab AWS_SECRET_ACCESS_KEY=ycollab-secret AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url http://127.0.0.1:9002 s3api head-bucket --bucket ycollab >/dev/null 2>&1 || \
+  aws --endpoint-url http://127.0.0.1:9002 s3api create-bucket --bucket ycollab
 
 YCOLLAB_TEST_DATABASE_URL=postgres://ycollab:ycollab@127.0.0.1:5433/ycollab YCOLLAB_TEST_REDIS_URL=redis://127.0.0.1:6380 YCOLLAB_TEST_S3_ENDPOINT=http://127.0.0.1:9002   go test ./... -race
 ```
 
-MinIO is there so the hand-rolled SigV4 signer is checked against a real S3
+RustFS is there so the hand-rolled SigV4 signer is checked against a real S3
 implementation rather than a mock that would agree with its own mistakes — one of
-those tests signs with a deliberately wrong secret to prove MinIO is checking.
+those tests signs with a deliberately wrong secret to prove the service checks it.
 
 Those tests build the server, kill the process outright, restart it and reconnect, because a
 graceful shutdown gets to flush and a crash does not.
@@ -928,7 +933,7 @@ MIT — see [LICENSE](LICENSE). The same licence as `yjs`, `y-protocols`, `y-web
 reasoning, including why not Apache-2.0, is [D131](DECISIONS.md).
 
 This server has not run in production and has no users yet. The engineering is verified —
-byte-for-byte against real Yjs, under `-race` against real Postgres, Redis and MinIO — but
+byte-for-byte against real Yjs, under `-race` against real Postgres, Redis and RustFS — but
 verified is not the same as proven by traffic, and the limits that are known are stated in
 [Limits](#limits) and in the concerns at the end of [DECISIONS.md](DECISIONS.md) rather than
 left for you to find.
