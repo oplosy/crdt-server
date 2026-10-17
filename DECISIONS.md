@@ -805,16 +805,17 @@ another replica's flush window is not visible to a read here. Making it exact
 would mean a bus round trip on every read, on the chance that some other node
 holds the document.
 
-### D86. The state vector is the ETag
-It is already the version - it is what a client sends to say what it has, and
-what anti-entropy compares - so `If-None-Match` and `?sv=` fall out of it rather
-than being invented. Two replicas holding the same document produce the same
-ETag, which is what makes it usable behind a load balancer, and `?sv=` turns the
-state vector a webhook just delivered into a diff.
+### D86. The state vector is sync metadata; ETags validate representations
+The state vector is the version used by Yjs clients and anti-entropy to request
+missing structs. It does not advance for a delete-set-only update, so it cannot
+validate a GET response by itself. `ETag` hashes the selected response bytes:
+the full binary update, a binary diff for `?sv=`, or the rendered JSON body. The
+state vector header remains available on every response, including 304, and
+continues to serve the sync protocol. `Vary: Accept` identifies the negotiated
+JSON representation.
 
-Rejected: a monotonic version counter. It would have to be agreed across
-replicas, which is a consensus problem this server does not otherwise have, to
-replace something the protocol already carries.
+No new document revision counter is needed: the representation bytes already
+provide a validator that works across replicas serving the same response.
 
 ### D87. The JSON view has no "type" field, because the wire format has none
 The first version reported a type per root and a `rendered` flag. A test found
