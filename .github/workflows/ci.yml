@@ -73,12 +73,23 @@ jobs:
         run: |
           docker run -d --name rustfs -p 9002:9000 \
             -e RUSTFS_ACCESS_KEY=ycollab -e RUSTFS_SECRET_KEY=ycollab-secret \
-            --tmpfs /data rustfs/rustfs:1.0.1
+            rustfs/rustfs:1.0.1
           for _ in $(seq 30); do
-            curl -fsS http://127.0.0.1:9002/health/ready > /dev/null && break
+            if curl -fsS http://127.0.0.1:9002/health/ready > /dev/null; then
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' rustfs)" != true ]; then
+              docker ps -a --filter name=rustfs
+              docker logs rustfs
+              exit 1
+            fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:9002/health/ready > /dev/null
+          curl -fsS http://127.0.0.1:9002/health/ready > /dev/null || {
+            docker ps -a --filter name=rustfs
+            docker logs rustfs
+            exit 1
+          }
           aws --endpoint-url http://127.0.0.1:9002 s3api create-bucket --bucket ycollab
         env:
           AWS_ACCESS_KEY_ID: ycollab

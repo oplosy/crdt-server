@@ -55,8 +55,6 @@ services:
       RUSTFS_SECRET_KEY: ycollab-secret
     ports:
       - "127.0.0.1:9002:9000"
-    tmpfs:
-      - /data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/health/ready"]
       interval: 2s
