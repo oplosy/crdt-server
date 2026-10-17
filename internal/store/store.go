@@ -178,7 +178,7 @@ func ensureIn(ctx context.Context, tx pgx.Tx, id UUID, name string, owner UUID) 
 	}
 	var found UUID
 	var incarnation int64
-	if err := tx.QueryRow(ctx, `SELECT owner_id, incarnation FROM documents WHERE id = $1`, id).Scan(&found, &incarnation); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT owner_id, incarnation FROM documents WHERE id = $1 FOR SHARE`, id).Scan(&found, &incarnation); err != nil {
 		return NilUUID, 0, fmt.Errorf("store: read document identity: %w", err)
 	}
 	return found, incarnation, nil
