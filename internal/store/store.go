@@ -210,11 +210,13 @@ func (s *Store) Load(ctx context.Context, id UUID, name string, owner UUID) (*Do
 // LoadAny reads a document without checking who owns it, and without creating
 // it.
 //
-// Two differences from Load, both deliberate. It is above the tenancy boundary,
-// for the administrative surface, which serves an operator rather than a tenant
-// and can already delete any document; it is a separate method rather than a
-// flag so that reading past the boundary is a call somebody can grep for, and so
-// no call site can do it by leaving a parameter at its zero value.
+// Two differences from Load, both deliberate. It is used by the administrative
+// read surface, which serves an operator rather than a tenant and can already
+// delete any document. The compaction writer also uses it to rebase against
+// persisted state, and explicitly checks owner and immutable incarnation before
+// merging. It is a separate method rather than a flag so that reading past the
+// tenancy boundary is a call somebody can grep for, and so no call site can do
+// it by leaving a parameter at its zero value.
 //
 // And it never creates the row. Load creates one because opening a document is
 // how a document comes to exist. A read is not: a read of a name nothing has
@@ -390,11 +392,9 @@ func (s *Store) Compact(ctx context.Context, id, owner UUID, incarnation, genera
 	// future reader of this document; this order leaves, at worst, an object
 	// nothing points at. See blobs.go.
 	//
-	// It is written before the transaction below rather than inside it, because
-	// an object write is a network round trip and holding the document's
-	// advisory lock across one would block every other replica compacting it.
-	// The key carries the sequence number, so two replicas racing here write two
-	// different objects and the row decides which one counts.
+	// A unique key per attempt keeps competing and retried compactions from
+	// overwriting an object another committed row may name. This PUT currently
+	// occurs while the transaction and document advisory lock are held.
 	keyName, err := uniqueSnapshotKey(id)
 	if err != nil {
 		return generation, err
@@ -472,16 +472,17 @@ func (s *Store) Compact(ctx context.Context, id, owner UUID, incarnation, genera
 // one statement and cannot leave orphaned updates behind.
 //
 // A room on another replica can outlive this call - DELETE evicts the room on
-// the replica that served it and tells no other - and its next write cannot
-// bring the document back. Append's foreign key has no parent to point at, and
-// Compact only ever updates a row it expects to find. Both fail loudly and are
-// counted; the document stays gone. See the test that holds this.
+// the replica that served it and tells no other. Append fails while the row is
+// absent. The compaction writer detects a missing or changed incarnation and
+// stops compacting that stale room; its Append/version operations are not fenced
+// from a later recreation. See the tests for delete and recreation behavior.
 //
 // What is lost is what those clients typed between the delete and their room's
 // eviction, which is the honest cost of deleting a document somebody else is
 // still editing. With object storage on, the failed compaction has already
-// written its snapshot object by then, and nothing will ever name it: one
-// orphan per attempt, bounded by the key carrying its sequence number.
+// written its snapshot object by then, and nothing will ever name it. The
+// unique attempt key prevents it from replacing the recreated document's
+// snapshot; orphan cleanup remains an operational task.
 func (s *Store) Delete(ctx context.Context, id UUID) (bool, error) {
 	// The keys are collected before the rows go, because after the cascade
 	// nothing remembers which objects this document owned.

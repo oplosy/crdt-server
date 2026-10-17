@@ -20,9 +20,10 @@ package store
 // deleted whose object survives is an orphan; an object deleted whose row
 // survives is a version that has quietly become unreadable.
 //
-// Orphans are therefore possible by design, and only from a failure in between.
-// They are bounded - a snapshot key contains its sequence number and a version
-// key is written once - so nothing accumulates during normal running.
+// Orphans are possible by design after a failure between the object write and
+// row commit, or when a commit succeeds but its response is lost. Snapshot
+// objects use unique per-attempt keys, so retries cannot overwrite a live
+// snapshot; orphan cleanup remains an operational task.
 
 import (
 	"context"

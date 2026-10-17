@@ -268,18 +268,19 @@ are handed out before commit, so a row with a lower seq can become visible *afte
 higher seq. With the brief's filter, such a row is skipped forever - silent data loss.
 Compaction deletes exactly the rows it folded in, so anything still in the table has not been
 folded in, and if a row is ever re-applied redundantly it costs nothing, because updates are
-idempotent. This is the cheap half of the fix for [C6]; the expensive half is not needed yet.
+idempotent. This remains necessary for [C6]. The room writer also reloads the complete
+remaining log before replacing a snapshot, so a late lower-seq row can be merged into the
+replacement rather than skipped.
 
-### D36. The room encodes snapshots, the writer names the rows they cover
-Compaction needs two things that live in different goroutines: the document, which only the
-room may touch, and the set of log rows actually written, which only the writer knows. So the
-room encodes the snapshot and hands it over, and the writer flushes what it has queued and
-compacts against the seqs it has accumulated (see [D41]). The snapshot can cover more than
-those rows do; the extra updates survive in the log and are applied again on the next load,
-which is free. Rejected: having the writer ask the room for a snapshot (a round trip in the
-other direction, and the room would still have to encode it), and letting the room decide which
-rows are covered (it would have to guess, and a wrong guess deletes rows that were never
-written).
+### D36. The room supplies an immutable candidate; the writer rebases before pruning
+The room owns the live CRDT document, so it encodes an immutable candidate and hands it to the
+writer. The writer flushes queued updates, reloads the current persisted snapshot and every
+remaining log row, then merges those with the candidate in a separate temporary CRDT document.
+It asks `Store.Compact` to replace the snapshot only against the generation and document
+incarnation it loaded, and supplies the exact seqs included in the merge (including its
+accumulated local rows; see [D41]). If another replica wins first, the writer reloads and
+remerges within a bounded attempt count. It never mutates the room's live document. Unreadable
+rows or unresolved dependencies prevent pruning and leave the candidate for a later retry.
 
 ### D37. Writes are asynchronous, and the durability window is the flush interval
 The room hands updates to a per-room writer goroutine and carries on. A crash therefore loses
@@ -1492,26 +1493,26 @@ failure leaves a version that has quietly become unreadable.
 Both directions are tested by making a put fail on demand, and both were checked
 by reversing them and watching the tests go red.
 
-Orphans are therefore possible by design. They are bounded - a snapshot key
-contains its sequence number, a version key is written once - so nothing
-accumulates while the server is working.
+Orphans are therefore possible by design. Snapshot attempts use unique object
+keys, so a failed or ambiguous commit can leave an unreferenced object without
+overwriting the object named by a committed row. Orphan count is not bounded by
+the sequence number and cleanup remains operational work.
 
-### D126. A snapshot's key contains its sequence number
+### D126. Each snapshot attempt has its own immutable object key
 The obvious key is `snapshots/<document>`, overwritten each time. It is wrong as
 soon as there are two replicas.
 
-Compaction already guards against an older snapshot beating a newer one: an
-advisory lock serialises the transaction and the write only lands if it moves
-`snapshot_seq` forward ([C2]). But the object write happens *outside* that lock -
-it has to, or every replica compacting a document would queue behind a network
-round trip. So two replicas can both write the object, and with one shared key the
-loser's bytes could be the ones left behind, sitting under a row that says they
-are the winner's.
+Compaction serializes database replacement and uses an owner, immutable document
+incarnation, and monotonic snapshot generation compare-and-swap ([C2], [C6]).
+Generation is separate from `snapshot_seq`: a late lower-seq row can require a
+replacement at the same coverage watermark. The replacement's `snapshot_seq`
+is the maximum of its prior value and the exact rows folded by that snapshot.
 
-A key per sequence number makes the row and the object it names always agree. The
-loser's object is an orphan, and the one case where an orphan can be collected
-immediately - no row ever named it, so it is dropped as soon as the update
-reports `ErrStaleSnapshot`.
+Every attempt uses a unique immutable key. A stale compare-and-swap is known not
+to have named its candidate object, so that object can be dropped. If commit
+returns an ambiguous error, the candidate is retained because the database may
+have committed a row that references it. Such an object can become an orphan;
+cleanup is operational work.
 
 The superseded object is deleted after the commit, never before: a crash in
 between leaves an orphan, and the other order would leave the live row naming
@@ -2106,14 +2107,18 @@ decoder already reads. Deliberately not done now — it is surgery on the Phase 
 a round trip from a path that heals itself, and Yjs has the same behaviour, so no client is
 surprised by it.
 
-### C2. Compaction can race across replicas — resolved in Phase 3
-Any replica may compact any document (section 3, no ownership). Two replicas compacting
-concurrently could write snapshots out of order, and the loser's delete would then remove
-updates the winning snapshot does not contain — silent data loss. Resolved as planned:
-`Store.Compact` takes `pg_advisory_xact_lock` on the document and only writes a snapshot that
-moves `snapshot_seq` forward, returning `ErrStaleSnapshot` and changing nothing otherwise. A
-test asserts an older snapshot cannot overwrite a newer one. See also [C6], which is the part
-of the same problem that is *not* fixed yet.
+### C2. Compaction can race across replicas — resolved for snapshot replacement
+Any replica may compact any document (section 3, no ownership). A stale room snapshot can
+otherwise replace a newer persisted snapshot and lose updates. `Store.Compact` takes a
+per-document transaction advisory lock and compares owner, immutable document incarnation,
+and monotonic `snapshot_generation`; every successful replacement advances that generation,
+including replacements at the same `snapshot_seq`. The room writer reloads the persisted
+snapshot and all remaining rows, merges them with its immutable candidate in a temporary CRDT
+document, then retries a generation conflict a bounded number of times. It deletes only the
+exact rows folded into the replacement. This protects persisted compaction state; it does not
+change live-client convergence or fence stale-room Append/version calls. All replicas must run
+the new compaction code before this guarantee applies in a rolling upgrade. See [C6] for
+out-of-order sequence allocation and row coverage.
 
 ### C3. Awareness needs a server-side timeout — resolved in Phase 2
 `outdatedTimeout` is client-side only (2.9). A client that vanishes without sending
