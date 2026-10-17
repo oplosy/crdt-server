@@ -597,22 +597,24 @@ laptop and wrong for anything reachable - so the Kubernetes manifest sets it, as
 it sets `-max-rooms`.
 
 ### D73. Durable writes are an option, not the default
-`-durable-writes` makes the room wait for an update to be on disk before it
-relays it, closing the flush window [D37] leaves open. It is off by default
-because it puts a database round trip on every keystroke, and the window it
-closes is already covered for the case that actually happens: a client that was
-editing when the server died still holds its own copy and sends it back on
-reconnect. It exists because "how much may we lose" is a question only the
-deployment can answer, and the honest answer for some of them is "nothing".
+`-durable-writes` makes the room wait for the final result of a bounded append
+retry sequence before it relays an update, reducing the normal unflushed window
+[D37] leaves open. It is off by default
+because it puts a database round trip on every keystroke. It may help when a
+client retains and resends an edit after a server restart, but that is not
+guaranteed when no client still holds it. It exists because "how much may we
+lose" is a question only the deployment can answer, and the honest answer for
+some of them is "nothing".
 
 What it promises is narrower than the name suggests, and the difference matters
-when reading an incident: the room waits for the write to be attempted, not for
-it to succeed. A failed write is logged and counted on
-`ycollab_store_failed_total`, and the update is relayed regardless. The
+when reading an incident: the room waits for up to three attempts within one
+30-second batch deadline, not for proof that the update is on disk. A final
+failure is logged and counted on `ycollab_store_failed_total`, and the update
+is relayed regardless; the exhausted batch is not queued for later replay. The
 alternative - block until the database answers - turns a database outage into
 every document on the server hanging, with the edits still only in memory
-either way. So the flag closes the flush window against a crash; it does not
-turn the server into one that refuses edits it cannot store. A deployment that
+either way. The flag reduces the normal unflushed window; it does not turn the
+server into one that refuses edits it cannot store. A deployment that
 needs the second thing needs an alert on that counter and a decision about what
 to do when it fires, because this server does not have one to make on its own.
 
@@ -781,9 +783,11 @@ tests use, so the format has exactly one reader and one writer.
 
 `document.store` is raised by the persist goroutine after `Append` returns
 without an error, not by the room when it queues the write. The room learns
-about it through an atomic counter it drains on its next tick. A failed write
-raises nothing, which is the point: a receiver mirroring the document must not
-record that it was saved when it was not.
+about it through an atomic counter it drains on its next tick. Its count is
+logical updates in confirmed batches, not a physical row count: if PostgreSQL
+committed but its reply was lost, a retry may leave duplicate idempotent Yjs
+rows. A final unconfirmed write raises no store event, so a receiver must not
+treat that event as a client-visible persisted acknowledgement.
 
 ### D85. A read is served by the room when there is one, and never starts one
 `GET /documents/{name}` asks the resident room through its mailbox, like every

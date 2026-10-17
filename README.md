@@ -58,14 +58,15 @@ Without `-database-url` the server still works, but a document lives only as lon
 is resident — five idle minutes by default. With it, updates are appended to a log, folded
 into a snapshot every 500 updates, and written out when a room is evicted.
 
-Writes are batched, so a crash can lose up to `-flush-interval` (200 ms by default) of edits
-that clients still hold and resend on reconnect. `-durable-writes` closes that window by
-writing each update before relaying it, at the cost of a database round trip per keystroke.
-It waits for the write to be *attempted*, not to succeed: a write that fails is logged, counted
-on `ycollab_store_failed_total`, and the update is relayed anyway, because a room that
-blocked until the database came back would take the document down with it. So the flag bounds
-what a crash loses; it does not make the server refuse edits while the database is unreachable
-— alert on that counter [D73].
+Writes are batched. Batching normally delays writes by `-flush-interval` (200 ms by default),
+and database latency, failures, or queue backpressure can extend the unconfirmed window.
+Room appends retry a narrow set of transient failures up to three attempts within one 30-second
+batch deadline. `-durable-writes` waits for that bounded sequence before relaying each update,
+at the cost of a database round trip per keystroke. It still relays after final failure: the
+batch is logged, counted on `ycollab_store_failed_total`, and dropped from the write queue rather
+than retained as a retryable batch; a later successful compaction may include resident state.
+The flag is not a persisted acknowledgement or an outage-recovery guarantee; alert on the
+failure counter [D73].
 
 `-max-conns` and `-max-rooms` bound what one node will hold. Both default to unlimited, which
 is right for a laptop and wrong for anything reachable; the Kubernetes manifests set them.

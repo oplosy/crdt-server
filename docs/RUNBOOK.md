@@ -51,26 +51,33 @@ A replica is not being scraped.
    `127.0.0.1:6060`, which is unreachable from another pod; the manifests set
    `0.0.0.0`.
 
-Clients on that replica have already reconnected elsewhere. There is nothing to
-recover: the room wrote its snapshot on the way out, or if it was killed, the
-last flush window was lost and the clients replayed it on reconnect.
+Clients on that replica have already reconnected elsewhere. If the room wrote
+its snapshot on the way out, no recovery is needed. If it was killed during the
+unconfirmed window, edits may be missing from PostgreSQL; clients that still
+hold those edits may resend them, but do not assume a client copy survived.
 
 ### YcollabWritesFailing
 
-`ycollab_store_failed_total` is climbing. Edits exist only in memory and in the
-clients that made them.
+`ycollab_store_failed_total` is climbing. Some edits may exist only in room
+memory or in the clients that made them; an ambiguous commit can also mean the
+database wrote an update but the server did not receive confirmation.
 
 1. Is Postgres up and reachable? `kubectl exec <pod> -- /bin/sh -c 'nc -z <host> 5432'`.
 2. Is it out of connections? `SELECT count(*) FROM pg_stat_activity;` against
    `max_connections`.
 3. Is it out of disk? A full volume shows up here first.
 
-**Do not restart the replicas while this is firing.** Their memory holds the
-edits the database does not have. Fix the database and the next flush writes
-everything queued; the write queue holds 4096 updates per document, and the room
-blocks rather than dropping them when it fills. If you must restart, take a
-per-document backup first (below) — that read comes from the room's memory,
-which is exactly the copy at risk.
+**Do not restart the replicas while this is firing.** Their memory holds edits
+that may not be in the database. Room appends retry a narrow set of transient
+failures up to three attempts within one 30-second batch deadline. After those
+attempts fail, that batch is dropped from the writer queue; fixing PostgreSQL
+does not retry it. A later successful compaction may include resident state,
+but is not a replay guarantee. The queue holds 4096 waiting updates per document,
+and the room blocks rather than dropping new edits when it fills. If you must restart,
+take a per-document backup first (below) — that read comes from room memory,
+which is the copy at risk. After storage recovers, verify and restore missing
+state from a backup or surviving client copies; reconnect sync is not guaranteed
+to recover an edit no client still holds.
 
 ### YcollabDatabaseSlow
 
@@ -382,9 +389,12 @@ subdocuments, so walk the tree if your application nests them.
 
 - **Awareness.** Cursors and presence are never persisted, by design. They are
   rebuilt in seconds by the clients that are still connected.
-- **The last flush window.** Up to `-flush-interval` (200 ms) of edits are in
-  memory and not yet written. `-durable-writes` removes that window at the cost
-  of a database round trip per update. The clients still hold them either way.
+- **Unconfirmed edits.** In healthy operation, up to `-flush-interval` (200 ms)
+  of edits may be in memory and not yet written. Database latency, failures, or
+  queue backpressure can extend that window. `-durable-writes` waits for a bounded
+  append retry sequence before relaying, but still relays after final failure;
+  the failed batch is not retained for replay. Clients may hold a copy, but
+  this is not guaranteed after they disconnect.
 - **Redis.** Nothing in it needs backing up. It carries live fanout only.
 - **Object storage**, if `-s3-bucket` is set. `pg_dump` no longer contains the
   documents: it holds the rows, and the rows name objects. **A database backup

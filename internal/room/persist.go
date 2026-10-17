@@ -3,8 +3,11 @@ package room
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mesutokul/ycollab/internal/crdt"
 	"github.com/mesutokul/ycollab/internal/metrics"
 	"github.com/mesutokul/ycollab/internal/store"
@@ -52,8 +55,12 @@ const (
 	persistQueue = 4096
 	// maxBatch caps one INSERT.
 	maxBatch = 256
-	// persistTimeout bounds a single database call.
+	// persistTimeout bounds one logical append batch, including retries.
 	persistTimeout = 30 * time.Second
+	// appendAttempts includes the first call. Backoff stays short because this
+	// is recovery from a brief transient failure, not a database outage policy.
+	appendAttempts     = 3
+	appendRetryBackoff = 100 * time.Millisecond
 )
 
 type persistJob struct {
@@ -218,7 +225,9 @@ func (r *Room) persist(jobs <-chan persistJob) {
 		}
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
-		seqs, err := r.cfg.Store.Append(ctx, r.docID, r.owner, r.incarnation, batch)
+		seqs, attempts, err := appendWithRetry(ctx, batch, func(ctx context.Context, payloads [][]byte) ([]int64, error) {
+			return r.cfg.Store.Append(ctx, r.docID, r.owner, r.incarnation, payloads)
+		})
 		cancel()
 		metrics.Observe(r.metrics.StoreDuration.WithLabelValues("append"), started)
 		if err != nil {
@@ -230,6 +239,9 @@ func (r *Room) persist(jobs <-chan persistJob) {
 			batch = batch[:0]
 			return false
 		} else {
+			if attempts > 1 {
+				r.log.Info("append recovered after transient errors", "attempts", attempts, "count", len(batch))
+			}
 			r.folded = append(r.folded, seqs...)
 			// The store event is raised here rather than in the room goroutine
 			// because this is the only place that knows the write actually
@@ -296,6 +308,61 @@ func (r *Room) persist(jobs <-chan persistJob) {
 				retryPending()
 			}
 		}
+	}
+}
+
+// appendWithRetry resends the exact immutable batch after a narrow set of
+// transient PostgreSQL and transport errors. Duplicate Yjs updates are
+// idempotent; the log may contain duplicate rows after an ambiguous commit.
+// The caller owns the single total deadline and receives only the final result.
+func appendWithRetry(ctx context.Context, batch [][]byte, appendFn func(context.Context, [][]byte) ([]int64, error)) ([]int64, int, error) {
+	for attempt := 1; attempt <= appendAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, attempt - 1, err
+		}
+		seqs, err := appendFn(ctx, batch)
+		if err == nil {
+			return seqs, attempt, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, attempt, ctxErr
+		}
+		if attempt == appendAttempts || !retryableAppendError(ctx, err) {
+			return nil, attempt, err
+		}
+
+		timer := time.NewTimer(appendRetryBackoff)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, attempt, ctx.Err()
+		}
+	}
+	panic("unreachable")
+}
+
+func retryableAppendError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, store.ErrStaleDocument) || errors.Is(err, store.ErrWrongOwner) {
+		return false
+	}
+	if pgconn.SafeToRetry(err) || errors.Is(err, pgconn.ErrConnClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
+	var sqlStateErr interface{ SQLState() string }
+	if !errors.As(err, &sqlStateErr) {
+		return false
+	}
+	switch sqlStateErr.SQLState() {
+	case "40001", "40P01", "08000", "08001", "08003", "08006", "08007", "57P01", "57P02", "57P03", "53300":
+		return true
+	default:
+		return false
 	}
 }
 

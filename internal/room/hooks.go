@@ -30,9 +30,9 @@ func (r *Room) changed() {
 	r.changes++
 }
 
-// stored records rows reaching the database. It is called from the persist
-// goroutine, which is why the counter is atomic: it is the one hook signal the
-// room goroutine does not raise itself.
+// stored records logical updates in confirmed append batches. An ambiguous
+// commit followed by a retry may leave duplicate physical rows. This runs in
+// the persist goroutine, so its counter is atomic.
 func (r *Room) stored(rows int) {
 	if !r.hooksEnabled() || rows <= 0 {
 		return
