@@ -156,9 +156,15 @@ func (s *Store) List(ctx context.Context, req ListRequest) (ListPage, error) {
 // way to change an owner: opening a document never reassigns it. A deployment
 // turning tenancy on has documents owned by nobody, and they stay that way -
 // visible to a connection that claims no owner, invisible to every tenant -
-// until somebody says out loud whose they are.
+// until somebody says out loud whose they are. A real owner change rotates the
+// incarnation so rooms on other replicas cannot write with their old identity;
+// assigning the existing owner is a no-op for that token.
 func (s *Store) SetOwner(ctx context.Context, id UUID, owner UUID) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE documents SET owner_id = $2 WHERE id = $1`, id, owner)
+	tag, err := s.pool.Exec(ctx, `UPDATE documents
+		SET owner_id = $2,
+		    incarnation = CASE WHEN owner_id IS DISTINCT FROM $2
+		                       THEN nextval('document_incarnation_seq') ELSE incarnation END
+		WHERE id = $1`, id, owner)
 	if err != nil {
 		return false, fmt.Errorf("store: set owner: %w", err)
 	}

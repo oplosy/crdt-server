@@ -47,6 +47,10 @@ type Snapshot struct {
 	// log when it loads a document, and this is how the read path says the same
 	// thing rather than handing back quietly incomplete bytes.
 	Skipped int
+	// These identify the coherent stored read for guarded administrative
+	// writes. They are internal metadata, not part of the HTTP representation.
+	Owner       store.UUID
+	Incarnation int64
 }
 
 // readCmd asks the room for a snapshot. Like every other command it goes
@@ -150,6 +154,8 @@ func Fetch(ctx context.Context, p Persistence, name string, sv []byte) (Snapshot
 		return Snapshot{}, err
 	}
 	snapshot.Skipped = skipped
+	snapshot.Owner = stored.Owner
+	snapshot.Incarnation = stored.Incarnation
 	return snapshot, nil
 }
 

@@ -104,7 +104,7 @@ func (r *Room) publish(kind cluster.Kind, payload []byte, counter *atomic.Uint64
 		return
 	}
 	job := pubJob{
-		env:     cluster.Envelope{Origin: r.cfg.NodeID, Kind: kind, Payload: payload},
+		env:     cluster.Envelope{Origin: r.cfg.NodeID, Kind: kind, HasIncarnation: r.hasIncarnation, Incarnation: r.incarnation, Payload: payload},
 		counter: counter,
 	}
 	select {
@@ -134,6 +134,10 @@ func (r *Room) publishLoop(pub <-chan pubJob) {
 
 // remoteEnvelope applies one envelope from another replica.
 func (r *Room) remoteEnvelope(env cluster.Envelope) {
+	if env.HasIncarnation != r.hasIncarnation || (r.hasIncarnation && env.Incarnation != r.incarnation) {
+		r.stats.RemoteRejected.Add(1)
+		return
+	}
 	switch env.Kind {
 	case cluster.KindUpdate:
 		r.remoteUpdate(env.Payload)

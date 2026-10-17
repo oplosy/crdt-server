@@ -46,7 +46,7 @@ func TestConcurrentReplicasWriteOneVersion(t *testing.T) {
 				Payload:     []byte{byte(i + 1)},
 				Label:       fmt.Sprint(i),
 			}
-			written[i], errs[i] = s.SaveVersion(context.Background(), id, v, time.Hour)
+			written[i], errs[i] = saveVersionCurrent(t, s, context.Background(), id, v, time.Hour)
 		}()
 	}
 	start.Done()
@@ -105,7 +105,7 @@ func TestSaveVersionTakesTheDocumentLock(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.SaveVersion(context.Background(), id,
+		_, err := saveVersionCurrent(t, s, context.Background(), id,
 			store.Version{StateVector: []byte{1}, Payload: []byte{1}}, 0)
 		done <- err
 	}()

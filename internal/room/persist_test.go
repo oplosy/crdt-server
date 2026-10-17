@@ -38,20 +38,22 @@ type fakeStore struct {
 // Ensure records the owner the first caller claimed and answers every later
 // one with it, which is the part of the real store's behaviour the tenancy
 // boundary rests on.
-func (f *fakeStore) Ensure(_ context.Context, _ store.UUID, name string, owner store.UUID) (store.UUID, error) {
+func (f *fakeStore) Ensure(_ context.Context, _ store.UUID, name string, owner store.UUID) (store.UUID, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.loadErr != nil {
-		return store.NilUUID, f.loadErr
+		return store.NilUUID, 0, f.loadErr
 	}
 	if f.owners == nil {
 		f.owners = make(map[string]store.UUID)
 	}
 	if found, ok := f.owners[name]; ok {
-		return found, nil
+		return found, f.doc.Incarnation, nil
 	}
 	f.owners[name] = owner
-	return owner, nil
+	f.doc.Owner = owner
+	f.doc.Incarnation = 1
+	return owner, f.doc.Incarnation, nil
 }
 
 func (f *fakeStore) Load(_ context.Context, _ store.UUID, name string, owner store.UUID) (*store.Document, error) {
@@ -81,9 +83,12 @@ func (f *fakeStore) LoadAny(context.Context, store.UUID) (*store.Document, error
 	return &doc, nil
 }
 
-func (f *fakeStore) Append(_ context.Context, _ store.UUID, payloads [][]byte) ([]int64, error) {
+func (f *fakeStore) Append(_ context.Context, _ store.UUID, owner store.UUID, incarnation int64, payloads [][]byte) ([]int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.doc.Exists && (f.doc.Owner != owner || f.doc.Incarnation != incarnation) {
+		return nil, store.ErrStaleDocument
+	}
 	if f.appendErr != nil {
 		return nil, f.appendErr
 	}
@@ -411,7 +416,7 @@ func TestCompactKeepsPendingRowsUntilDependenciesArrive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fake.Append(context.Background(), r.docID, [][]byte{dependencyUpdate}); err != nil {
+	if _, err := fake.Append(context.Background(), r.docID, fake.doc.Owner, fake.doc.Incarnation, [][]byte{dependencyUpdate}); err != nil {
 		t.Fatal(err)
 	}
 	r.folded = append(r.folded, 2)
@@ -556,12 +561,16 @@ func TestCompactRebasesConcurrentReplicaUpdatesInPostgres(t *testing.T) {
 	if _, err := s.Load(ctx, id, name, owner); err != nil {
 		t.Fatal(err)
 	}
+	initial, err := s.LoadAny(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	updates := scenarioUpdates(t, "text-three-client-interleaved")
 	if len(updates) < 7 {
 		t.Fatalf("need at least 7 scenario updates, have %d", len(updates))
 	}
 	x, y, z := updates[0], updates[3], updates[6]
-	xSeqs, err := s.Append(ctx, id, [][]byte{x})
+	xSeqs, err := s.Append(ctx, id, owner, initial.Incarnation, [][]byte{x})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,7 +600,7 @@ func TestCompactRebasesConcurrentReplicaUpdatesInPostgres(t *testing.T) {
 	if err := bDoc.ApplyUpdate(y); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(ctx, id, [][]byte{y}); err != nil {
+	if _, err := s.Append(ctx, id, owner, initial.Incarnation, [][]byte{y}); err != nil {
 		t.Fatal(err)
 	}
 	xy, err := bDoc.EncodeStateAsUpdate(nil)
@@ -605,7 +614,7 @@ func TestCompactRebasesConcurrentReplicaUpdatesInPostgres(t *testing.T) {
 	if _, err := s.Compact(ctx, id, owner, bLoaded.Incarnation, bLoaded.SnapshotGeneration, xy, bLoaded.Seqs); err != nil {
 		t.Fatalf("replica B compaction: %v", err)
 	}
-	zSeqs, err := s.Append(ctx, id, [][]byte{z})
+	zSeqs, err := s.Append(ctx, id, owner, initial.Incarnation, [][]byte{z})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,7 +806,7 @@ func TestDurableWritesLandBeforeTheUpdateIsRelayed(t *testing.T) {
 		// Negative means write-through.
 		FlushInterval: -1,
 		// A flush interval that would otherwise hide the difference.
-		CompactAfter: 1000,
+		CompactAfter: 2,
 	})
 
 	author := &fakeConn{id: 1}
@@ -822,6 +831,9 @@ func TestDurableWritesLandBeforeTheUpdateIsRelayed(t *testing.T) {
 	appended, _ := store.counts()
 	if appended != 1 {
 		t.Fatalf("%d updates were written by the time the peer saw it, want 1", appended)
+	}
+	if _, snapshots := store.counts(); snapshots != 0 {
+		t.Fatal("one durable edit counted twice and triggered early compaction")
 	}
 }
 

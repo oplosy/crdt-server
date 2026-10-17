@@ -45,6 +45,36 @@ func TestEnvelopeCarriesAnEmptyPayload(t *testing.T) {
 	}
 }
 
+func TestEnvelopePreservesFullIncarnationRange(t *testing.T) {
+	for _, incarnation := range []int64{0, 1<<53 + 17, -1 << 63, 1<<63 - 1} {
+		want := Envelope{Origin: 1, Kind: KindUpdate, HasIncarnation: true, Incarnation: incarnation}
+		raw, err := want.Encode()
+		if err != nil {
+			t.Fatalf("encode %d: %v", incarnation, err)
+		}
+		got, err := Decode(raw)
+		if err != nil || !got.HasIncarnation || got.Incarnation != incarnation {
+			t.Fatalf("round trip %d = %+v, %v", incarnation, got, err)
+		}
+	}
+	legacy, err := (Envelope{Origin: 1, Kind: KindUpdate, HasIncarnation: true}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	noStore, err := Decode(legacy)
+	if err != nil || !noStore.HasIncarnation || noStore.Incarnation != 0 {
+		t.Fatalf("legacy zero token = %+v, %v", noStore, err)
+	}
+	noDB, err := (Envelope{Origin: 1, Kind: KindUpdate}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	noStore, err = Decode(noDB)
+	if err != nil || noStore.HasIncarnation {
+		t.Fatalf("no-store marker = %+v, %v", noStore, err)
+	}
+}
+
 // A node id has to be encodable, so the generator's masking is part of the
 // contract rather than an implementation detail.
 func TestNewNodeIDIsEncodable(t *testing.T) {
@@ -78,8 +108,9 @@ func TestEnvelopeRejectsWhatItCannotTrust(t *testing.T) {
 		buf  []byte
 		want error
 	}{
-		{"future version", []byte{1, 7, 0, 1, 9}, ErrVersion},
-		{"unknown kind", []byte{0, 7, 99, 1, 9}, ErrKind},
+		{"legacy version", []byte{0, 7, 0, 0, 1, 9}, ErrVersion},
+		{"future version", []byte{2, 7, 0, 0, 1, 9}, ErrVersion},
+		{"unknown kind", []byte{1, 7, 99, 0, 1, 9}, ErrKind},
 		{"trailing bytes", append(append([]byte(nil), valid...), 0xff), ErrTrailingBytes},
 	}
 	for _, tc := range cases {
@@ -122,7 +153,8 @@ func FuzzDecodeNeverPanics(f *testing.F) {
 		if err != nil {
 			t.Fatalf("re-encoded envelope will not decode: %v", err)
 		}
-		if again.Origin != env.Origin || again.Kind != env.Kind || !bytes.Equal(again.Payload, env.Payload) {
+		if again.Origin != env.Origin || again.Kind != env.Kind || again.HasIncarnation != env.HasIncarnation ||
+			again.Incarnation != env.Incarnation || !bytes.Equal(again.Payload, env.Payload) {
 			t.Fatalf("round trip changed %+v into %+v", env, again)
 		}
 	})
@@ -182,10 +214,10 @@ func TestMemoryBusDeliversToEverySubscriberIncludingThePublisher(t *testing.T) {
 //
 // The seed is the one the fuzzer found.
 func TestAnOriginTooLargeToEncodeIsRefused(t *testing.T) {
-	// version 0, then a varUint of seven continuation bytes that reads as
+	// version 1, then a varUint of seven continuation bytes that reads as
 	// 27,362,913,877,714,637 - three times what lib0 will write - then kind 2
 	// and an empty payload.
-	buf := []byte{0x00, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0x30, 0x02, 0x00}
+	buf := []byte{0x01, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0x30, 0x02, 0x00, 0x00}
 	if _, err := Decode(buf); !errors.Is(err, ErrOriginOutOfRange) {
 		t.Fatalf("Decode returned %v, want ErrOriginOutOfRange", err)
 	}

@@ -22,12 +22,12 @@ type Persistence interface {
 	// rebase against persisted state, and checks owner and incarnation before
 	// merging; the administrative read path also uses it above tenancy.
 	LoadAny(ctx context.Context, id store.UUID) (*store.Document, error)
-	// Ensure creates the document row and reports who owns it. Import needs it
-	// because a restore writes to the log without reading first, and the log's
+	// Ensure creates the document row and reports its owner and incarnation.
+	// Import needs it because a restore writes to the log without reading first, and the log's
 	// foreign key wants a parent; the manager needs it to settle who may open a
 	// document before a room exists.
-	Ensure(ctx context.Context, id store.UUID, name string, owner store.UUID) (store.UUID, error)
-	Append(ctx context.Context, id store.UUID, payloads [][]byte) ([]int64, error)
+	Ensure(ctx context.Context, id store.UUID, name string, owner store.UUID) (store.UUID, int64, error)
+	Append(ctx context.Context, id, owner store.UUID, incarnation int64, payloads [][]byte) ([]int64, error)
 	Compact(ctx context.Context, id, owner store.UUID, incarnation, generation int64, snapshot []byte, folded []int64) (int64, error)
 }
 
@@ -36,8 +36,8 @@ type Persistence interface {
 // because every test that only cares about writes should not have to implement
 // three more methods.
 type Versioning interface {
-	SaveVersion(ctx context.Context, id store.UUID, v store.Version, minAge time.Duration) (bool, error)
-	PruneVersions(ctx context.Context, id store.UUID, keep int) (int64, error)
+	SaveVersion(ctx context.Context, id, owner store.UUID, incarnation int64, v store.Version, minAge time.Duration) (bool, error)
+	PruneVersions(ctx context.Context, id, owner store.UUID, incarnation int64, keep int) (int64, error)
 }
 
 const (
@@ -65,10 +65,10 @@ type persistJob struct {
 	// like everything else so the room goroutine never waits for a database
 	// call, and so writes for one document stay in order.
 	version *versionJob
-	// done, when set, is closed once this job has been written. It is what
-	// makes durable writes durable: the room waits on it before relaying the
-	// update, so a client is never told about an edit that is not on disk.
-	done chan struct{}
+	// done, when set, receives the append result for durable writes and
+	// administrative merges. Ordinary WebSocket edits keep their established
+	// relay-on-failure behavior.
+	done chan error
 }
 
 // load restores the document from the database: the snapshot, then every log
@@ -81,6 +81,7 @@ func (r *Room) load(ctx context.Context) error {
 		return err
 	}
 	r.incarnation = doc.Incarnation
+	r.hasIncarnation = true
 	defer func() { metrics.Observe(r.metrics.LoadDuration, started) }()
 	metrics.Observe(r.metrics.StoreDuration.WithLabelValues("load"), started)
 	if doc.Snapshot != nil {
@@ -126,23 +127,38 @@ func (r *Room) record(update []byte) {
 	if r.jobs == nil {
 		return
 	}
-	// The room broadcasts this slice too, and the writer keeps it until the
-	// batch is flushed, so it is copied rather than shared.
-	payload := make([]byte, len(update))
-	copy(payload, update)
-
 	if r.cfg.FlushInterval < 0 {
 		// Durable writes: hand the update over and wait for it to be written
 		// before returning, so it is on disk before anybody is told about it.
 		// This blocks the room, which is the whole cost of the option - every
 		// keystroke now pays a database round trip.
-		done := make(chan struct{})
-		r.jobs <- persistJob{payload: payload, done: done}
-		<-done
-	} else {
-		r.jobs <- persistJob{payload: payload}
+		_ = r.recordAndWait(update)
+		return
 	}
+	// The room broadcasts this slice too, and the writer keeps it until the
+	// batch is flushed, so it is copied rather than shared.
+	payload := append([]byte(nil), update...)
+	r.enqueue(payload, nil)
+	r.afterRecord()
+}
 
+func (r *Room) recordAndWait(update []byte) error {
+	if r.jobs == nil {
+		return nil
+	}
+	payload := append([]byte(nil), update...)
+	done := make(chan error, 1)
+	r.enqueue(payload, done)
+	err := <-done
+	r.afterRecord()
+	return err
+}
+
+func (r *Room) enqueue(payload []byte, done chan error) {
+	r.jobs <- persistJob{payload: payload, done: done}
+}
+
+func (r *Room) afterRecord() {
 	r.sinceSnapshot++
 	if r.sinceSnapshot >= r.cfg.CompactAfter {
 		r.requestCompaction()
@@ -188,15 +204,12 @@ func (r *Room) persist(jobs <-chan persistJob) {
 
 	var batch [][]byte
 	var pendingSnapshot []byte
-	// waiters are the durable-write jobs in the current batch; each is released
-	// once the batch is on disk, whether the write succeeded or not - a caller
-	// that waited forever on a database that is down would take the document
-	// with it, and the error is already logged loudly.
-	var waiters []chan struct{}
+	var waiters []chan error
 	flush := func() bool {
+		var flushErr error
 		defer func() {
 			for _, done := range waiters {
-				close(done)
+				done <- flushErr
 			}
 			waiters = waiters[:0]
 		}()
@@ -205,10 +218,11 @@ func (r *Room) persist(jobs <-chan persistJob) {
 		}
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
-		seqs, err := r.cfg.Store.Append(ctx, r.docID, batch)
+		seqs, err := r.cfg.Store.Append(ctx, r.docID, r.owner, r.incarnation, batch)
 		cancel()
 		metrics.Observe(r.metrics.StoreDuration.WithLabelValues("append"), started)
 		if err != nil {
+			flushErr = err
 			r.metrics.StoreFailed.WithLabelValues("append").Inc()
 			// The updates stay in memory and in every connected client. Say so
 			// loudly rather than pretending the write happened.

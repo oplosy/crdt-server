@@ -30,6 +30,10 @@ import (
 // fresh room; see registry.go.
 var ErrClosed = errors.New("room: closed")
 
+// ErrPersistence means an administrative room write was not confirmed by the
+// store. It wraps the underlying storage error.
+var ErrPersistence = errors.New("room: persistence failed")
+
 // ErrNoVersioning means the server is not keeping history, which is what a
 // server without a database is doing.
 var ErrNoVersioning = errors.New("room: no version history is kept")
@@ -204,7 +208,8 @@ type Room struct {
 	owner store.UUID
 	// incarnation is fixed at load and checked before every rebase, so an old
 	// room never merges its state into a recreated document.
-	incarnation int64
+	incarnation    int64
+	hasIncarnation bool
 	// usage is what the document costs, measured on the tick and published for
 	// the manager's memory budget. See memory.go.
 	usage usage

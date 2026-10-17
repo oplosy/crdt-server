@@ -198,7 +198,7 @@ func versionStored(ctx context.Context, documents *store.Store, name, label stri
 	}
 	// minAge zero: somebody asked by hand. The state-vector check still
 	// applies, so asking twice for an unchanged document stores one version.
-	return documents.SaveVersion(ctx, id, store.Version{
+	return documents.SaveVersion(ctx, id, snapshot.Owner, snapshot.Incarnation, store.Version{
 		StateVector: snapshot.StateVector,
 		Payload:     snapshot.Update,
 		Label:       label,

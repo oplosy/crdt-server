@@ -2,6 +2,7 @@ package room
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/mesutokul/ycollab/internal/metrics"
@@ -35,6 +36,7 @@ type versionJob struct {
 	// beforehand. Only the on-demand path waits.
 	done    chan struct{}
 	written *bool
+	result  chan error
 }
 
 // versionTick takes a version if one is due. Called from the room goroutine.
@@ -67,24 +69,34 @@ func (r *Room) versionTick(now time.Time) {
 func (r *Room) TakeVersion(label string) (bool, error) {
 	written := false
 	done := make(chan struct{})
+	result := make(chan error, 1)
 	reply := make(chan error, 1)
-	if err := r.send(versionCmd{label: label, done: done, written: &written, err: reply}); err != nil {
+	if err := r.send(versionCmd{label: label, done: done, written: &written, result: result, err: reply}); err != nil {
 		return false, err
 	}
-	select {
-	case err := <-reply:
-		if err != nil {
-			return false, err
-		}
-	case <-r.done:
-		return false, ErrClosed
+	if err := waitCommandReply(reply, r.done); err != nil {
+		return false, err
 	}
+	return waitVersion(done, r.persistDone, result, &written)
+}
+
+func waitVersion(done, persistDone <-chan struct{}, result <-chan error, written *bool) (bool, error) {
 	select {
 	case <-done:
-		return written, nil
-	case <-r.persistDone:
-		// The writer stopped without getting to it.
-		return false, ErrClosed
+		if err := <-result; err != nil {
+			return false, err
+		}
+		return *written, nil
+	case <-persistDone:
+		select {
+		case <-done:
+			if err := <-result; err != nil {
+				return false, err
+			}
+			return *written, nil
+		default:
+			return false, ErrClosed
+		}
 	}
 }
 
@@ -94,6 +106,7 @@ type versionCmd struct {
 	done    chan struct{}
 	written *bool
 	err     chan error
+	result  chan error
 }
 
 func (versionCmd) isCommand() {}
@@ -108,7 +121,7 @@ func (r *Room) takeVersion(c versionCmd) {
 	// script from filling the history with copies of an unchanged document.
 	r.versionDirty = false
 	r.lastVersion = r.cfg.Now()
-	r.queueVersion(versionJob{label: c.label, done: c.done, written: c.written})
+	r.queueVersion(versionJob{label: c.label, done: c.done, written: c.written, result: c.result})
 	c.err <- nil
 }
 
@@ -138,6 +151,9 @@ func (r *Room) queueVersion(job versionJob) {
 
 // failVersion releases a waiter when the version never got as far as the queue.
 func (r *Room) failVersion(job versionJob) {
+	if job.result != nil {
+		job.result <- errors.New("room: could not encode version")
+	}
 	if job.done != nil {
 		close(job.done)
 	}
@@ -148,16 +164,21 @@ func (r *Room) saveVersion(job versionJob) {
 	if job.done != nil {
 		defer close(job.done)
 	}
+	var resultErr error
+	if job.result != nil {
+		defer func() { job.result <- resultErr }()
+	}
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
-	written, err := r.versions.SaveVersion(ctx, r.docID, store.Version{
+	written, err := r.versions.SaveVersion(ctx, r.docID, r.owner, r.incarnation, store.Version{
 		StateVector: job.stateVector,
 		Payload:     job.payload,
 		Label:       job.label,
 	}, job.minAge)
 	metrics.Observe(r.metrics.StoreDuration.WithLabelValues("version"), started)
 	if err != nil {
+		resultErr = err
 		r.metrics.StoreFailed.WithLabelValues("version").Inc()
 		r.log.Error("could not save a version", "err", err)
 		return
@@ -178,8 +199,9 @@ func (r *Room) saveVersion(job versionJob) {
 	if r.cfg.VersionKeep <= 0 {
 		return
 	}
-	removed, err := r.versions.PruneVersions(ctx, r.docID, r.cfg.VersionKeep)
+	removed, err := r.versions.PruneVersions(ctx, r.docID, r.owner, r.incarnation, r.cfg.VersionKeep)
 	if err != nil {
+		resultErr = err
 		r.metrics.StoreFailed.WithLabelValues("prune_versions").Inc()
 		r.log.Error("could not prune versions", "err", err)
 		return

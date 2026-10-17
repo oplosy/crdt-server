@@ -15,6 +15,7 @@ import (
 
 	"github.com/mesutokul/ycollab/internal/crdt"
 	"github.com/mesutokul/ycollab/internal/room"
+	"github.com/mesutokul/ycollab/internal/store"
 )
 
 // Headers a caller reads. The state vector is on every response, including the
@@ -179,6 +180,13 @@ func mergeDocument(manager *room.Manager, documents room.Persistence, log *slog.
 			case errors.Is(err, room.ErrClosed):
 				// Evicted while we were asking; fall through to the store,
 				// which now has its final snapshot.
+			case errors.Is(err, store.ErrStaleDocument):
+				http.Error(w, "the document changed while the update was being applied", http.StatusConflict)
+				return
+			case errors.Is(err, room.ErrPersistence):
+				log.Error("could not persist resident document merge", "document", name, "err", err)
+				http.Error(w, "could not merge the update", http.StatusInternalServerError)
+				return
 			default:
 				http.Error(w, "the body would not apply: "+err.Error(), http.StatusBadRequest)
 				return
