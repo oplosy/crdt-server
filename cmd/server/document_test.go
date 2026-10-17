@@ -60,8 +60,8 @@ func TestReadingADocumentOverHTTP(t *testing.T) {
 		t.Fatalf("read %q, want %q", got, want)
 	}
 
-	// The state vector is the version: it is the ETag, and it is a header on
-	// every response so a caller can compare without parsing the body.
+	// The ETag validates the selected response bytes; the state vector remains
+	// a header on every response so a caller can request a Yjs diff.
 	etag := resp.Header.Get("ETag")
 	if etag == "" {
 		t.Fatal("no ETag")

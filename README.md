@@ -431,12 +431,15 @@ directly:
 curl -s http://127.0.0.1:6060/documents/my-doc > my-doc.bin
 ```
 
-Every response carries the state vector twice: as `X-Ycollab-State-Vector` (base64) and as the
-`ETag`. The state vector *is* the version, so both work the way you would expect:
+Every response carries `X-Ycollab-State-Vector` (base64) for Yjs sync and an `ETag` for the
+selected HTTP representation. The ETag changes when those response bytes change, including a
+delete-only update that leaves the state vector unchanged. JSON and `Accept` negotiation select
+their own response representation; `?sv=` hashes the returned diff bytes. Thus:
 
-- `If-None-Match: <etag>` → `304` when nothing has changed.
+- `If-None-Match: <etag>` → `304` when that selected response has not changed.
 - `?sv=<base64 state vector>` → only what you are missing, rather than the whole document. This
-  is the pair to the webhook: the event hands you a state vector, this turns it into a diff.
+  is the pair to the webhook: the event hands you a state vector, this turns it into a diff. The
+  state vector tracks Yjs struct clocks; it is not an HTTP content validator.
 
 `X-Ycollab-Resident` says where the answer came from. A document somebody is editing is read
 from the room, so it is exactly what those clients see. One nobody is editing is read from the
