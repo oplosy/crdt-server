@@ -2,6 +2,7 @@ package room
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -50,6 +51,25 @@ func TestMergeReachesTheConnectedClients(t *testing.T) {
 	}
 }
 
+func TestResidentMergeReturnsUnconfirmedStoreFailure(t *testing.T) {
+	update := readFixture(t, "text-insert-single", "update-000.bin")
+	fake := &fakeStore{appendErr: errors.New("append failed")}
+	r := New(Config{Name: "notes", Store: fake, Logger: quietLogger(), FlushInterval: time.Hour})
+	r.jobs = make(chan persistJob, 2)
+	r.persistDone = make(chan struct{})
+	go r.persist(r.jobs)
+	t.Cleanup(func() {
+		close(r.jobs)
+		<-r.persistDone
+	})
+	done := make(chan error, 1)
+	go func() { done <- r.Merge(update) }()
+	r.handle(<-r.mailbox)
+	if err := <-done; !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Merge error = %v, want ErrPersistence", err)
+	}
+}
+
 // A body that is not an update is refused, and leaves the document alone.
 func TestMergingRubbishChangesNothing(t *testing.T) {
 	r := New(Config{Name: "notes", IdleTimeout: time.Hour, Logger: quietLogger()})
@@ -93,8 +113,8 @@ func TestImportWritesAndPublishes(t *testing.T) {
 	}
 	select {
 	case env := <-envelopes:
-		if env.Origin != 42 || env.Kind != cluster.KindUpdate {
-			t.Errorf("published origin=%d kind=%d", env.Origin, env.Kind)
+		if env.Origin != 42 || env.Kind != cluster.KindUpdate || !env.HasIncarnation || env.Incarnation != 1 {
+			t.Errorf("published origin=%d kind=%d has-incarnation=%v incarnation=%d", env.Origin, env.Kind, env.HasIncarnation, env.Incarnation)
 		}
 		if string(env.Payload) != string(update) {
 			t.Error("the published payload is not the update")

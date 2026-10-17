@@ -29,7 +29,7 @@ func compressible(n int) []byte {
 // test that skipped this step would silently assert nothing.
 func compact(t *testing.T, s *store.Store, id store.UUID, snapshot []byte) {
 	t.Helper()
-	seqs, err := s.Append(t.Context(), id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, t.Context(), id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestASnapshotSurvivesCompression(t *testing.T) {
 	s, ctx := openStore(t)
 	name := fmt.Sprintf("packed-%d", time.Now().UnixNano())
 	id := store.DocumentID(name)
-	if _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,7 +73,7 @@ func TestRowsWrittenBeforeCompressionStillRead(t *testing.T) {
 	oldName := fmt.Sprintf("legacy-snap-%d", run)
 	oldID := store.DocumentID(oldName)
 	oldBytes := compressible(150)
-	if _, err := s.Ensure(ctx, oldID, oldName, store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(ctx, oldID, oldName, store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 	// Written the way the previous version of this server wrote it: the bytes
@@ -83,7 +83,7 @@ func TestRowsWrittenBeforeCompressionStillRead(t *testing.T) {
 	newName := fmt.Sprintf("new-snap-%d", run)
 	newID := store.DocumentID(newName)
 	newBytes := compressible(150)
-	if _, err := s.Ensure(ctx, newID, newName, store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(ctx, newID, newName, store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 	compact(t, s, newID, newBytes)
@@ -121,13 +121,13 @@ func TestAVersionSurvivesCompression(t *testing.T) {
 	s, ctx := openStore(t)
 	name := fmt.Sprintf("packed-version-%d", time.Now().UnixNano())
 	id := store.DocumentID(name)
-	if _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 
 	payload := compressible(300)
 	v := store.Version{StateVector: []byte{1, 2, 3}, Payload: payload, Label: "before the migration"}
-	if written, err := s.SaveVersion(ctx, id, v, 0); err != nil || !written {
+	if written, err := saveVersionCurrent(t, s, ctx, id, v, 0); err != nil || !written {
 		t.Fatalf("written=%v err=%v", written, err)
 	}
 
@@ -167,15 +167,15 @@ func TestCompressionDoesNotBreakVersionDeduplication(t *testing.T) {
 	s, ctx := openStore(t)
 	name := fmt.Sprintf("dedup-%d", time.Now().UnixNano())
 	id := store.DocumentID(name)
-	if _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 
 	v := store.Version{StateVector: []byte{9, 9}, Payload: compressible(100)}
-	if written, err := s.SaveVersion(ctx, id, v, 0); err != nil || !written {
+	if written, err := saveVersionCurrent(t, s, ctx, id, v, 0); err != nil || !written {
 		t.Fatalf("the first version: written=%v err=%v", written, err)
 	}
-	if written, err := s.SaveVersion(ctx, id, v, 0); err != nil || written {
+	if written, err := saveVersionCurrent(t, s, ctx, id, v, 0); err != nil || written {
 		t.Fatalf("an identical version was written again: written=%v err=%v", written, err)
 	}
 }

@@ -37,11 +37,23 @@ func (r *Room) Merge(update []byte) error {
 	if err := r.send(mergeCmd{update: update, reply: reply}); err != nil {
 		return err
 	}
+	return waitCommandReply(reply, r.done)
+}
+
+// waitCommandReply prefers a result already buffered when room shutdown wins
+// the select. If shutdown happens before the actor handles the command, there
+// is no result and the caller gets ErrClosed.
+func waitCommandReply(reply <-chan error, done <-chan struct{}) error {
 	select {
 	case err := <-reply:
 		return err
-	case <-r.done:
-		return ErrClosed
+	case <-done:
+		select {
+		case err := <-reply:
+			return err
+		default:
+			return ErrClosed
+		}
 	}
 }
 
@@ -53,7 +65,12 @@ func (r *Room) merge(c mergeCmd) {
 		c.reply <- err
 		return
 	}
-	r.record(c.update)
+	if err := r.recordAndWait(c.update); err != nil {
+		// The actor has already integrated the CRDT update. Do not publish it
+		// after an unconfirmed append; the room's next load remains authoritative.
+		c.reply <- fmt.Errorf("%w: %w", ErrPersistence, err)
+		return
+	}
 	r.changed()
 	r.versionDirty = true
 	// The clients holding this document have to be told, or the next thing they
@@ -102,14 +119,14 @@ func Import(ctx context.Context, cfg MergeConfig, name string, update []byte) er
 	// never heard of this name is the disaster-recovery case, and it is the one
 	// that must not need a read first.
 	id := store.DocumentID(name)
-	owner, err := cfg.Store.Ensure(ctx, id, name, store.OwnerID(cfg.Owner))
+	owner, incarnation, err := cfg.Store.Ensure(ctx, id, name, store.OwnerID(cfg.Owner))
 	if err != nil {
 		return err
 	}
 	if cfg.Owner != "" && owner != store.OwnerID(cfg.Owner) {
 		return fmt.Errorf("%w: %s", store.ErrWrongOwner, name)
 	}
-	if _, err := cfg.Store.Append(ctx, id, [][]byte{update}); err != nil {
+	if _, err := cfg.Store.Append(ctx, id, owner, incarnation, [][]byte{update}); err != nil {
 		return fmt.Errorf("append: %w", err)
 	}
 	if cfg.Bus == nil {
@@ -119,7 +136,7 @@ func Import(ctx context.Context, cfg MergeConfig, name string, update []byte) er
 	// until it evicted and reloaded. Publishing under this node's id is what
 	// every room already does, and the replicas that hold it apply it as an
 	// ordinary remote update.
-	env := cluster.Envelope{Origin: cfg.NodeID, Kind: cluster.KindUpdate, Payload: update}
+	env := cluster.Envelope{Origin: cfg.NodeID, Kind: cluster.KindUpdate, HasIncarnation: true, Incarnation: incarnation, Payload: update}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := cfg.Bus.Publish(ctx, name, env); err != nil {

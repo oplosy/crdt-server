@@ -107,7 +107,28 @@ func (s *Store) Migrate(ctx context.Context) error {
 // even though callers outside it are told the same thing either way.
 var ErrWrongOwner = errors.New("store: the document belongs to another owner")
 
-// Ensure creates the document row if it is not there, and reports who owns it.
+// ErrStaleDocument means a room tried to write using a document identity that
+// no longer matches the row's owner and incarnation.
+var ErrStaleDocument = errors.New("store: document identity changed")
+
+// requireIdentity locks the parent row through the caller's transaction, so a
+// delete/recreate cannot pass the check and then redirect the write to a new
+// incarnation.
+func requireIdentity(ctx context.Context, tx pgx.Tx, id, owner UUID, incarnation int64) error {
+	var foundOwner UUID
+	var foundIncarnation int64
+	err := tx.QueryRow(ctx, `SELECT owner_id, incarnation FROM documents WHERE id = $1 FOR SHARE`, id).Scan(&foundOwner, &foundIncarnation)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (foundOwner != owner || foundIncarnation != incarnation)) {
+		return ErrStaleDocument
+	}
+	if err != nil {
+		return fmt.Errorf("store: document identity: %w", err)
+	}
+	return nil
+}
+
+// Ensure creates the document row if it is not there, and reports its owner and
+// immutable incarnation token.
 //
 // Two callers need this. One writes to the log without reading the document
 // first - restoring into a document that was just deleted, or into a database
@@ -121,21 +142,21 @@ var ErrWrongOwner = errors.New("store: the document belongs to another owner")
 // from the name by a one-way hash, so a row without one can be loaded but not
 // listed; rewriting it on every open would let a hash collision rename somebody
 // else's document.
-func (s *Store) Ensure(ctx context.Context, id UUID, name string, owner UUID) (UUID, error) {
+func (s *Store) Ensure(ctx context.Context, id UUID, name string, owner UUID) (UUID, int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return NilUUID, fmt.Errorf("store: ensure document: %w", err)
+		return NilUUID, 0, fmt.Errorf("store: ensure document: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
-	found, err := ensureIn(ctx, tx, id, name, owner)
+	found, incarnation, err := ensureIn(ctx, tx, id, name, owner)
 	if err != nil {
-		return NilUUID, err
+		return NilUUID, 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return NilUUID, fmt.Errorf("store: ensure document: %w", err)
+		return NilUUID, 0, fmt.Errorf("store: ensure document: %w", err)
 	}
-	return found, nil
+	return found, incarnation, nil
 }
 
 // ensureIn is the insert-then-read both Ensure and Load do, in whatever
@@ -148,18 +169,19 @@ func (s *Store) Ensure(ctx context.Context, id UUID, name string, owner UUID) (U
 // insert their own owner - which under READ COMMITTED is the same shape of bug
 // as D102, and here it would be a tenancy boundary rather than a retention
 // count.
-func ensureIn(ctx context.Context, tx pgx.Tx, id UUID, name string, owner UUID) (UUID, error) {
+func ensureIn(ctx context.Context, tx pgx.Tx, id UUID, name string, owner UUID) (UUID, int64, error) {
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO documents (id, owner_id, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`,
 		id, owner, name,
 	); err != nil {
-		return NilUUID, fmt.Errorf("store: ensure document: %w", err)
+		return NilUUID, 0, fmt.Errorf("store: ensure document: %w", err)
 	}
 	var found UUID
-	if err := tx.QueryRow(ctx, `SELECT owner_id FROM documents WHERE id = $1`, id).Scan(&found); err != nil {
-		return NilUUID, fmt.Errorf("store: read owner: %w", err)
+	var incarnation int64
+	if err := tx.QueryRow(ctx, `SELECT owner_id, incarnation FROM documents WHERE id = $1 FOR SHARE`, id).Scan(&found, &incarnation); err != nil {
+		return NilUUID, 0, fmt.Errorf("store: read document identity: %w", err)
 	}
-	return found, nil
+	return found, incarnation, nil
 }
 
 // A Document is what was on disk: a snapshot, possibly empty, and the log rows
@@ -168,8 +190,8 @@ type Document struct {
 	// Exists distinguishes a missing LoadAny result from a newly created but
 	// otherwise empty document.
 	Exists bool
-	// Incarnation is stable for a row's lifetime and changes after delete and
-	// recreation. Legacy rows migrated from older schemas have token zero.
+	// Incarnation changes after delete/recreate and on owner transfer. Legacy
+	// rows migrated from older schemas have token zero.
 	Incarnation int64
 	// SnapshotGeneration advances on every successful compaction, even when
 	// snapshot_seq does not move.
@@ -236,7 +258,7 @@ func (s *Store) load(ctx context.Context, id UUID, name string, owner UUID, any 
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
 	if !any {
-		found, err := ensureIn(ctx, tx, id, name, owner)
+		found, _, err := ensureIn(ctx, tx, id, name, owner)
 		if err != nil {
 			return nil, err
 		}
@@ -299,7 +321,9 @@ func (s *Store) load(ctx context.Context, id UUID, name string, owner UUID, any 
 	return doc, nil
 }
 
-// Append writes updates to the log and returns the seq assigned to each.
+// Append writes updates to the log and returns the seq assigned to each. The
+// owner and incarnation must come from the caller's coherent load or Ensure;
+// they are checked while the parent row is locked through the transaction.
 //
 // The payloads go in one statement: an editing session produces a steady drip
 // of small updates, and a round trip each would make the database the thing
@@ -307,11 +331,28 @@ func (s *Store) load(ctx context.Context, id UUID, name string, owner UUID, any 
 //
 // The caller keeps the seqs so that a later compaction can delete exactly the
 // rows its snapshot covers.
-func (s *Store) Append(ctx context.Context, id UUID, payloads [][]byte) ([]int64, error) {
+func (s *Store) Append(ctx context.Context, id, owner UUID, incarnation int64, payloads [][]byte) ([]int64, error) {
 	if len(payloads) == 0 {
 		return nil, nil
 	}
-	rows, err := s.pool.Query(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: append: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	var foundOwner UUID
+	var foundIncarnation int64
+	err = tx.QueryRow(ctx,
+		`SELECT owner_id, incarnation FROM documents WHERE id = $1 FOR SHARE`, id,
+	).Scan(&foundOwner, &foundIncarnation)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (foundOwner != owner || foundIncarnation != incarnation)) {
+		return nil, ErrStaleDocument
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: append identity: %w", err)
+	}
+	rows, err := tx.Query(ctx,
 		`INSERT INTO doc_updates (doc_id, payload)
 		 SELECT $1, payload FROM unnest($2::bytea[]) AS payload
 		 RETURNING seq`,
@@ -329,6 +370,10 @@ func (s *Store) Append(ctx context.Context, id UUID, payloads [][]byte) ([]int64
 		seqs = append(seqs, seq)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: append: %w", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("store: append: %w", err)
 	}
 	return seqs, nil

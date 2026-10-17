@@ -261,7 +261,7 @@ func (m *Manager) settleOwner(name string, want store.UUID) error {
 	}
 	ctx, cancel := context.WithTimeout(m.ctx, settleTimeout)
 	defer cancel()
-	found, err := p.Ensure(ctx, store.DocumentID(name), name, want)
+	found, _, err := p.Ensure(ctx, store.DocumentID(name), name, want)
 	if err != nil {
 		return err
 	}

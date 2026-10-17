@@ -97,7 +97,7 @@ func newDoc(t *testing.T, s *store.Store, ctx context.Context, label string) (st
 	t.Helper()
 	name := fmt.Sprintf("%s-%d", label, time.Now().UnixNano())
 	id := store.DocumentID(name)
-	if _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(ctx, id, name, store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 	return id, name
@@ -110,7 +110,7 @@ func TestASnapshotGoesToTheBucket(t *testing.T) {
 	id, name := newDoc(t, s, ctx, "s3-snap")
 
 	snapshot := bytes.Repeat([]byte("a document that is worth storing "), 400)
-	seqs, err := s.Append(ctx, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestAListingReportsTheSizeOfABlobBackedDocument(t *testing.T) {
 	id, name := newDoc(t, s, ctx, "s3-size")
 
 	snapshot := bytes.Repeat([]byte("a document that is worth storing "), 400)
-	seqs, err := s.Append(ctx, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestAVersionListingReportsTheSizeOfABlobBackedVersion(t *testing.T) {
 	id, _ := newDoc(t, s, ctx, "s3-version-size")
 
 	payload := bytes.Repeat([]byte("history is the expensive part "), 400)
-	if written, err := s.SaveVersion(ctx, id, store.Version{StateVector: []byte{1}, Payload: payload}, 0); err != nil || !written {
+	if written, err := saveVersionCurrent(t, s, ctx, id, store.Version{StateVector: []byte{1}, Payload: payload}, 0); err != nil || !written {
 		t.Fatalf("written=%v err=%v", written, err)
 	}
 
@@ -209,7 +209,7 @@ func TestAVersionGoesToTheBucket(t *testing.T) {
 
 	payload := bytes.Repeat([]byte("history is the expensive part "), 400)
 	v := store.Version{StateVector: []byte{1}, Payload: payload, Label: "before the migration"}
-	if written, err := s.SaveVersion(ctx, id, v, 0); err != nil || !written {
+	if written, err := saveVersionCurrent(t, s, ctx, id, v, 0); err != nil || !written {
 		t.Fatalf("written=%v err=%v", written, err)
 	}
 
@@ -240,7 +240,7 @@ func TestRowsInTheDatabaseAndInTheBucketReadTheSame(t *testing.T) {
 	plain, _ := openStore(t)
 	inlineID, inlineName := newDoc(t, plain, ctx, "s3-mixed-inline")
 	inlineBytes := bytes.Repeat([]byte("stored in the database "), 300)
-	seqs, err := plain.Append(ctx, inlineID, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, plain, ctx, inlineID, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestRowsInTheDatabaseAndInTheBucketReadTheSame(t *testing.T) {
 	// And one written after.
 	bucketID, bucketName := newDoc(t, s, ctx, "s3-mixed-bucket")
 	bucketBytes := bytes.Repeat([]byte("stored in the bucket "), 300)
-	seqs, err = s.Append(ctx, bucketID, [][]byte{{0, 0}})
+	seqs, err = appendCurrent(t, s, ctx, bucketID, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestRowsInTheDatabaseAndInTheBucketReadTheSame(t *testing.T) {
 func TestARowNamingAnObjectWithNoBucketIsAnError(t *testing.T) {
 	s, _, ctx := blobStore(t)
 	id, name := newDoc(t, s, ctx, "s3-orphaned-config")
-	seqs, err := s.Append(ctx, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestAFailedPutWritesNoRow(t *testing.T) {
 	s, rec, ctx := blobStore(t)
 	id, name := newDoc(t, s, ctx, "s3-failed-put")
 
-	seqs, err := s.Append(ctx, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestAFailedPutWritesNoRow(t *testing.T) {
 	}
 
 	// The same for a version: no object, no row.
-	if written, err := s.SaveVersion(ctx, id, store.Version{StateVector: []byte{7}, Payload: []byte("x")}, 0); err == nil && written {
+	if written, err := saveVersionCurrent(t, s, ctx, id, store.Version{StateVector: []byte{7}, Payload: []byte("x")}, 0); err == nil && written {
 		t.Error("a version was written with a bucket that was refusing writes")
 	}
 }
@@ -355,14 +355,14 @@ func TestDeletingADocumentDeletesItsObjects(t *testing.T) {
 	s, rec, ctx := blobStore(t)
 	id, _ := newDoc(t, s, ctx, "s3-delete")
 
-	seqs, err := s.Append(ctx, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := compactCurrent(t, s, ctx, id, bytes.Repeat([]byte("snapshot "), 100), seqs); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SaveVersion(ctx, id,
+	if _, err := saveVersionCurrent(t, s, ctx, id,
 		store.Version{StateVector: []byte{3}, Payload: bytes.Repeat([]byte("version "), 100)}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestPruningVersionsDeletesTheirObjects(t *testing.T) {
 			StateVector: []byte{byte(i)},
 			Payload:     bytes.Repeat([]byte(fmt.Sprintf("version %d ", i)), 100),
 		}
-		if written, err := s.SaveVersion(ctx, id, v, 0); err != nil || !written {
+		if written, err := saveVersionCurrent(t, s, ctx, id, v, 0); err != nil || !written {
 			t.Fatalf("version %d: written=%v err=%v", i, written, err)
 		}
 	}
@@ -405,7 +405,7 @@ func TestPruningVersionsDeletesTheirObjects(t *testing.T) {
 		t.Fatalf("%d version objects, want 5", len(before))
 	}
 
-	n, err := s.PruneVersions(ctx, id, 2)
+	n, err := pruneVersionsCurrent(t, s, ctx, id, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestANewSnapshotRemovesTheOneItReplaces(t *testing.T) {
 
 	var keys []string
 	for i := range 3 {
-		seqs, err := s.Append(ctx, id, [][]byte{{0, 0}})
+		seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{0, 0}})
 		if err != nil {
 			t.Fatal(err)
 		}

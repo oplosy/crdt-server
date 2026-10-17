@@ -2116,7 +2116,8 @@ including replacements at the same `snapshot_seq`. The room writer reloads the p
 snapshot and all remaining rows, merges them with its immutable candidate in a temporary CRDT
 document, then retries a generation conflict a bounded number of times. It deletes only the
 exact rows folded into the replacement. This protects persisted compaction state; it does not
-change live-client convergence or fence stale-room Append/version calls. All replicas must run
+change live-client convergence. Stale-room Append/version operations are fenced separately in
+[D136]. All replicas must run
 the new compaction code before this guarantee applies in a rolling upgrade. See [C6] for
 out-of-order sequence allocation and row coverage.
 
@@ -2145,3 +2146,17 @@ an array instead of an integer.
 ### C4. Section 8 vs. TipTap
 Resolved in D8, kept here as a pointer: section 8's "no `YXmlFragment`" and Phase 2's "TipTap
 works" are in tension, and the resolution is decode-everything / expose-little.
+
+### D136. Room writes belong to a document incarnation
+A room captures owner and immutable incarnation when it loads a document. Append, version save,
+and version pruning lock and validate that parent identity in the same transaction as their
+write, so an old room cannot write into a deleted/recreated document or after an owner transfer.
+`SetOwner` rotates incarnation only when ownership changes, preventing A→B→A from reviving an old
+room. Internal cluster envelopes carry a versioned presence marker and the full signed BIGINT
+incarnation; every message kind is checked after the actor loads, preserving subscribe-before-load
+without a lost-update window. Legacy persisted incarnation zero remains distinct from a node
+without a database. This does not evict old rooms immediately, prevent clients from retaining
+old state, add persisted client acknowledgements, or change the public Yjs protocol. Private
+envelope v0 is rejected, so replicas must be upgraded together. A failed resident admin merge is
+not broadcast and reports its store error, but its already-applied in-memory CRDT state is not
+rolled back. See [docs/DURABILITY.md](docs/DURABILITY.md).

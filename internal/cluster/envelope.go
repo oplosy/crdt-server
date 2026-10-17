@@ -5,13 +5,13 @@
 // Yjs update, an awareness update, or an encoded state vector. Nothing in here
 // interprets a payload.
 //
-// The encoding is lib0's, the same one the client protocol uses. That is not
-// because anything outside this project reads these bytes - nothing does - but
-// because the alternative is a second serialisation format in a codebase that
-// already has one that is tested against real Yjs.
+// The outer fields use lib0, as the client protocol does. The internal v1
+// incarnation token is fixed-width big-endian because PostgreSQL BIGINT uses
+// the full signed 64-bit range, beyond lib0's safe integer limit.
 package cluster
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -37,7 +37,7 @@ const (
 // envelopeVersion prefixes every envelope. Two replicas running different
 // builds is normal during a rolling restart, and a version byte turns "the
 // bytes stopped making sense" into a message we can log and skip.
-const envelopeVersion uint64 = 0
+const envelopeVersion uint64 = 1
 
 var (
 	// ErrVersion means the envelope was written by a build that does not agree
@@ -62,6 +62,10 @@ type Envelope struct {
 	// id. That comparison is the whole loop prevention.
 	Origin uint64
 	Kind   Kind
+	// HasIncarnation distinguishes a persisted legacy incarnation zero from
+	// messages published by a server without persistence.
+	HasIncarnation bool
+	Incarnation    int64
 	// Payload aliases the buffer Decode was given.
 	Payload []byte
 }
@@ -75,10 +79,20 @@ type Envelope struct {
 // produced an envelope that decoded and then would not survive being written
 // back out.
 func (e Envelope) Encode() ([]byte, error) {
-	enc := lib0.NewEncoderSize(len(e.Payload) + 16)
+	enc := lib0.NewEncoderSize(len(e.Payload) + 25)
 	enc.WriteVarUint(envelopeVersion)
 	enc.WriteVarUint(e.Origin)
 	enc.WriteVarUint(uint64(e.Kind))
+	if e.HasIncarnation {
+		enc.WriteUint8(1)
+		var identity [8]byte
+		binary.BigEndian.PutUint64(identity[:], uint64(e.Incarnation))
+		for _, b := range identity {
+			enc.WriteUint8(b)
+		}
+	} else {
+		enc.WriteUint8(0)
+	}
 	enc.WriteVarUint8Array(e.Payload)
 	if err := enc.Err(); err != nil {
 		return nil, fmt.Errorf("cluster: encode envelope: %w", err)
@@ -119,6 +133,24 @@ func Decode(buf []byte) (Envelope, error) {
 	default:
 		return Envelope{}, fmt.Errorf("%w: %d", ErrKind, kind)
 	}
+	hasIncarnation, err := d.ReadUint8()
+	if err != nil {
+		return Envelope{}, err
+	}
+	if hasIncarnation > 1 {
+		return Envelope{}, fmt.Errorf("cluster: invalid incarnation marker %d", hasIncarnation)
+	}
+	var incarnation int64
+	if hasIncarnation == 1 {
+		var identity [8]byte
+		for i := range identity {
+			identity[i], err = d.ReadUint8()
+			if err != nil {
+				return Envelope{}, err
+			}
+		}
+		incarnation = int64(binary.BigEndian.Uint64(identity[:]))
+	}
 	payload, err := d.ReadVarUint8Array()
 	if err != nil {
 		return Envelope{}, err
@@ -126,7 +158,7 @@ func Decode(buf []byte) (Envelope, error) {
 	if !d.Done() {
 		return Envelope{}, ErrTrailingBytes
 	}
-	return Envelope{Origin: origin, Kind: Kind(kind), Payload: payload}, nil
+	return Envelope{Origin: origin, Kind: Kind(kind), HasIncarnation: hasIncarnation == 1, Incarnation: incarnation, Payload: payload}, nil
 }
 
 func (k Kind) String() string {

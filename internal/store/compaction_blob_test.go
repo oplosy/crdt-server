@@ -119,7 +119,7 @@ func useMemoryBlobs(t *testing.T) (*store.Store, *memoryBlobs, context.Context, 
 
 func makeSnapshot(t *testing.T, s *store.Store, blobs *memoryBlobs, ctx context.Context, id store.UUID, snapshot []byte) (*store.Document, string) {
 	t.Helper()
-	seqs, err := s.Append(ctx, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func makeSnapshot(t *testing.T, s *store.Store, blobs *memoryBlobs, ctx context.
 
 func TestSameWatermarkCompactionsKeepTheWinningSnapshotObject(t *testing.T) {
 	s, blobs, c, id, name := useMemoryBlobs(t)
-	seqs, err := s.Append(c, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, c, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestBlockedSnapshotReaderKeepsObjectsUntilItsTransactionEnds(t *testing.T) 
 	t.Run("compaction", func(t *testing.T) {
 		s, blobs, c, id, name := useMemoryBlobs(t)
 		base, oldKey := makeSnapshot(t, s, blobs, c, id, []byte("old snapshot"))
-		seqs, err := s.Append(c, id, [][]byte{{1, 0}})
+		seqs, err := appendCurrent(t, s, c, id, [][]byte{{1, 0}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -328,7 +328,7 @@ func TestCompactionKeepsBlobWhenCommitReplyIsLost(t *testing.T) {
 	s.UseBlobs(blobs, nil)
 	c := ctx(t)
 	id, name := newDoc(t, s, c, "commit-reply-loss")
-	seqs, err := s.Append(c, id, [][]byte{{0, 0}})
+	seqs, err := appendCurrent(t, s, c, id, [][]byte{{0, 0}})
 	if err != nil {
 		t.Fatal(err)
 	}

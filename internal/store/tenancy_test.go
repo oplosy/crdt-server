@@ -20,7 +20,7 @@ func TestTheFirstOpenerOwnsTheDocument(t *testing.T) {
 	id := store.DocumentID(name)
 	acme, globex := store.OwnerID("acme"), store.OwnerID("globex")
 
-	owner, err := s.Ensure(ctx, id, name, acme)
+	owner, _, err := s.Ensure(ctx, id, name, acme)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestTheFirstOpenerOwnsTheDocument(t *testing.T) {
 		t.Fatalf("the creator does not own the document")
 	}
 	// Somebody else asking gets the truth, not their own wish.
-	owner, err = s.Ensure(ctx, id, name, globex)
+	owner, _, err = s.Ensure(ctx, id, name, globex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestConcurrentCreatorsAgreeOnOneOwner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			owner, err := s.Ensure(ctx, id, name, store.OwnerID(fmt.Sprintf("tenant-%d", i%2)))
+			owner, _, err := s.Ensure(ctx, id, name, store.OwnerID(fmt.Sprintf("tenant-%d", i%2)))
 			if err != nil {
 				errs <- err
 				return
@@ -108,7 +108,7 @@ func TestReadingAMissingDocumentDoesNotCreateIt(t *testing.T) {
 
 	// The name is still free, and a tenant may take it.
 	acme := store.OwnerID("acme")
-	owner, err := s.Ensure(ctx, id, name, acme)
+	owner, _, err := s.Ensure(ctx, id, name, acme)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,13 +128,13 @@ func TestListingIsFilteredByOwnerAndPaged(t *testing.T) {
 	for i := range 5 {
 		name := fmt.Sprintf("list-%d-acme-%02d", run, i)
 		acmeNames = append(acmeNames, name)
-		if _, err := s.Ensure(ctx, store.DocumentID(name), name, acme); err != nil {
+		if _, _, err := s.Ensure(ctx, store.DocumentID(name), name, acme); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := range 3 {
 		name := fmt.Sprintf("list-%d-globex-%02d", run, i)
-		if _, err := s.Ensure(ctx, store.DocumentID(name), name, globex); err != nil {
+		if _, _, err := s.Ensure(ctx, store.DocumentID(name), name, globex); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -196,10 +196,10 @@ func TestAListingCarriesWhatIsNeededToActOnIt(t *testing.T) {
 	id := store.DocumentID(name)
 	owner := store.OwnerID("acme")
 
-	if _, err := s.Ensure(ctx, id, name, owner); err != nil {
+	if _, _, err := s.Ensure(ctx, id, name, owner); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(ctx, id, [][]byte{{1, 2, 3}, {4, 5}}); err != nil {
+	if _, err := appendCurrent(t, s, ctx, id, [][]byte{{1, 2, 3}, {4, 5}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -235,7 +235,7 @@ func TestSetOwnerMovesADocument(t *testing.T) {
 	id := store.DocumentID(name)
 	acme, globex := store.OwnerID("acme"), store.OwnerID("globex")
 
-	if _, err := s.Ensure(ctx, id, name, acme); err != nil {
+	if _, _, err := s.Ensure(ctx, id, name, acme); err != nil {
 		t.Fatal(err)
 	}
 	moved, err := s.SetOwner(ctx, id, globex)
@@ -263,6 +263,50 @@ func TestSetOwnerMovesADocument(t *testing.T) {
 	}
 }
 
+func TestSetOwnerRotatesOnlyWhenOwnerChanges(t *testing.T) {
+	s, ctx := openStore(t)
+	name := fmt.Sprintf("owner-incarnation-%d", time.Now().UnixNano())
+	id := store.DocumentID(name)
+	a, b := store.OwnerID("owner-a"), store.OwnerID("owner-b")
+	if _, err := s.Load(ctx, id, name, a); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.LoadAny(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetOwner(ctx, id, a); err != nil {
+		t.Fatal(err)
+	}
+	same, err := s.LoadAny(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same.Incarnation != first.Incarnation {
+		t.Fatalf("no-op owner assignment changed incarnation %d to %d", first.Incarnation, same.Incarnation)
+	}
+	if _, err := s.SetOwner(ctx, id, b); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.LoadAny(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Incarnation == first.Incarnation {
+		t.Fatal("owner transfer did not rotate incarnation")
+	}
+	if _, err := s.SetOwner(ctx, id, a); err != nil {
+		t.Fatal(err)
+	}
+	third, err := s.LoadAny(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Incarnation == second.Incarnation || third.Incarnation == first.Incarnation {
+		t.Fatalf("A->B->A reused an incarnation: %d, %d, %d", first.Incarnation, second.Incarnation, third.Incarnation)
+	}
+}
+
 // A row written before the name column existed can be given its name, once,
 // and then it appears in listings.
 func TestNamingARowThatHasNoName(t *testing.T) {
@@ -272,7 +316,7 @@ func TestNamingARowThatHasNoName(t *testing.T) {
 
 	// A row with no name is what Import used to write, and what every row in a
 	// database from before this column looks like.
-	if _, err := s.Ensure(ctx, id, "", store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(ctx, id, "", store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 	named, err := s.Name(ctx, id, name)

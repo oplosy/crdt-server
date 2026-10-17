@@ -163,14 +163,14 @@ func TestAppendAndLoadPreservesOrder(t *testing.T) {
 	}
 
 	want := [][]byte{[]byte("one"), []byte("two"), []byte("three")}
-	first, err := s.Append(c, id, want[:2])
+	first, err := appendCurrent(t, s, c, id, want[:2])
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	if len(first) != 2 {
 		t.Fatalf("got %d seqs for 2 payloads", len(first))
 	}
-	second, err := s.Append(c, id, want[2:])
+	second, err := appendCurrent(t, s, c, id, want[2:])
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestCompactFoldsTheLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	folded, err := s.Append(c, id, [][]byte{[]byte("a"), []byte("b"), []byte("c")})
+	folded, err := appendCurrent(t, s, c, id, [][]byte{[]byte("a"), []byte("b"), []byte("c")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,11 +245,11 @@ func TestCompactKeepsUpdatesAboveTheWatermark(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	folded, err := s.Append(c, id, [][]byte{[]byte("folded")})
+	folded, err := appendCurrent(t, s, c, id, [][]byte{[]byte("folded")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(c, id, [][]byte{[]byte("in flight")}); err != nil {
+	if _, err := appendCurrent(t, s, c, id, [][]byte{[]byte("in flight")}); err != nil {
 		t.Fatal(err)
 	}
 	if err := compactCurrent(t, s, c, id, []byte("snapshot"), folded); err != nil {
@@ -275,11 +275,11 @@ func TestCompactRefusesToGoBackwards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := s.Append(c, id, [][]byte{[]byte("a")})
+	first, err := appendCurrent(t, s, c, id, [][]byte{[]byte("a")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.Append(c, id, [][]byte{[]byte("b")})
+	second, err := appendCurrent(t, s, c, id, [][]byte{[]byte("b")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestCompactPreservesConcurrentReplicaUpdates(t *testing.T) {
 	}
 	x, y, z := update("update-000.bin"), update("update-003.bin"), update("update-006.bin")
 
-	if _, err := s.Append(c, id, [][]byte{x}); err != nil {
+	if _, err := appendCurrent(t, s, c, id, [][]byte{x}); err != nil {
 		t.Fatal(err)
 	}
 	a := crdt.NewDoc(0)
@@ -362,7 +362,7 @@ func TestCompactPreservesConcurrentReplicaUpdates(t *testing.T) {
 	if err := b.ApplyUpdate(y); err != nil {
 		t.Fatal(err)
 	}
-	ySeqs, err := s.Append(c, id, [][]byte{y})
+	ySeqs, err := appendCurrent(t, s, c, id, [][]byte{y})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ func TestCompactPreservesConcurrentReplicaUpdates(t *testing.T) {
 	if err := a.ApplyUpdate(z); err != nil {
 		t.Fatal(err)
 	}
-	zSeqs, err := s.Append(c, id, [][]byte{z})
+	zSeqs, err := appendCurrent(t, s, c, id, [][]byte{z})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func TestCompactIsAtomicForReaders(t *testing.T) {
 	if _, err := s.Load(c, id, "", store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
-	folded, err := s.Append(c, id, [][]byte{[]byte("a"), []byte("b")})
+	folded, err := appendCurrent(t, s, c, id, [][]byte{[]byte("a"), []byte("b")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,11 +470,11 @@ func TestCompactOnlyDeletesTheRowsItFolded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	early, err := s.Append(c, id, [][]byte{[]byte("early")})
+	early, err := appendCurrent(t, s, c, id, [][]byte{[]byte("early")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	late, err := s.Append(c, id, [][]byte{[]byte("late")})
+	late, err := appendCurrent(t, s, c, id, [][]byte{[]byte("late")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +531,7 @@ func TestCompactCannotCrossDocumentRecreation(t *testing.T) {
 	if deleted, err := s.Delete(c, id); err != nil || !deleted {
 		t.Fatalf("delete: deleted=%v err=%v", deleted, err)
 	}
-	if _, err := s.Ensure(c, id, "", store.NilUUID); err != nil {
+	if _, _, err := s.Ensure(c, id, "", store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
 	current, err := s.LoadAny(c, id)
@@ -581,7 +581,7 @@ func TestUpdateCount(t *testing.T) {
 	if _, err := s.Load(c, id, "", store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(c, id, [][]byte{[]byte("a"), []byte("b")}); err != nil {
+	if _, err := appendCurrent(t, s, c, id, [][]byte{[]byte("a"), []byte("b")}); err != nil {
 		t.Fatal(err)
 	}
 	n, err := s.UpdateCount(c, id)
@@ -632,7 +632,7 @@ func TestDeleteRemovesTheDocumentAndItsLog(t *testing.T) {
 	if _, err := s.Load(ctx, id, "", store.NilUUID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Append(ctx, id, [][]byte{{1}, {2}}); err != nil {
+	if _, err := appendCurrent(t, s, ctx, id, [][]byte{{1}, {2}}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := s.UpdateCount(ctx, id); err != nil || n != 2 {
@@ -676,7 +676,7 @@ func TestDeleteIdleSparesRecentlyWrittenDocuments(t *testing.T) {
 	// anything newer than it.
 	time.Sleep(1200 * time.Millisecond)
 	cutoff := time.Now().Add(-600 * time.Millisecond)
-	if _, err := s.Append(ctx, active, [][]byte{{1}}); err != nil {
+	if _, err := appendCurrent(t, s, ctx, active, [][]byte{{1}}); err != nil {
 		t.Fatal(err)
 	}
 

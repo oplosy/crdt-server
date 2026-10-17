@@ -2,7 +2,10 @@ package store_test
 
 import (
 	"bytes"
+	"errors"
 	"testing"
+
+	"github.com/mesutokul/ycollab/internal/store"
 )
 
 // What a room that outlived the document it was serving can do to the database.
@@ -22,7 +25,7 @@ func TestARoomThatOutlivedItsDocumentCannotBringItBack(t *testing.T) {
 
 	// A document with a snapshot and a log, which is what a room that has been
 	// open for a while is holding.
-	seqs, err := s.Append(ctx, id, [][]byte{{1, 2}, {3, 4}})
+	seqs, err := appendCurrent(t, s, ctx, id, [][]byte{{1, 2}, {3, 4}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,9 +42,9 @@ func TestARoomThatOutlivedItsDocumentCannotBringItBack(t *testing.T) {
 	}
 
 	// The surviving room appends, as it would on the next keystroke.
-	later, err := s.Append(ctx, id, [][]byte{{5, 6}})
-	if err == nil {
-		t.Errorf("appending to a deleted document was accepted, writing seqs %v", later)
+	later, err := s.Append(ctx, id, base.Owner, base.Incarnation, [][]byte{{5, 6}})
+	if !errors.Is(err, store.ErrStaleDocument) {
+		t.Errorf("stale append to deleted document = seqs %v err %v, want ErrStaleDocument", later, err)
 	}
 
 	// And compacts, as it would on eviction. This is the one that would matter:

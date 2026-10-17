@@ -70,8 +70,9 @@ type Version struct {
 // "keep the last 24" on a three-replica cluster silently becomes "keep the last
 // eight moments". Compact takes the same lock, for the same reason (C2, C6).
 //
-// It reports whether a row was written.
-func (s *Store) SaveVersion(ctx context.Context, id UUID, v Version, minAge time.Duration) (bool, error) {
+// The captured owner and incarnation fence the write from a deleted/recreated
+// document. It reports whether a row was written.
+func (s *Store) SaveVersion(ctx context.Context, id, owner UUID, incarnation int64, v Version, minAge time.Duration) (bool, error) {
 	if len(v.Payload) == 0 {
 		return false, errors.New("store: a version needs a payload")
 	}
@@ -85,6 +86,9 @@ func (s *Store) SaveVersion(ctx context.Context, id UUID, v Version, minAge time
 	// documents never wait for each other.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, id); err != nil {
 		return false, fmt.Errorf("store: save version lock: %w", err)
+	}
+	if err := requireIdentity(ctx, tx, id, owner, incarnation); err != nil {
+		return false, err
 	}
 
 	// History is the largest thing in this database - a whole document per
@@ -202,14 +206,25 @@ func (s *Store) LoadVersion(ctx context.Context, id UUID, version int64) (*Versi
 // Unbounded history is unbounded storage - each row is a whole document - so
 // something has to say when to stop, and a count is the form an operator can
 // reason about: "the last twenty-four" is a promise, "a gigabyte" is not.
-func (s *Store) PruneVersions(ctx context.Context, id UUID, keep int) (int64, error) {
+func (s *Store) PruneVersions(ctx context.Context, id, owner UUID, incarnation int64, keep int) (int64, error) {
 	if keep <= 0 {
 		return 0, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("store: prune versions: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, id); err != nil {
+		return 0, fmt.Errorf("store: prune versions lock: %w", err)
+	}
+	if err := requireIdentity(ctx, tx, id, owner, incarnation); err != nil {
+		return 0, err
 	}
 	// RETURNING names the objects the deleted rows owned, in the same statement
 	// that removes them - so the set is exactly what went, with no second query
 	// that could see a different answer.
-	rows, err := s.pool.Query(ctx,
+	rows, err := tx.Query(ctx,
 		`DELETE FROM doc_versions
 		  WHERE doc_id = $1
 		    AND id NOT IN (
@@ -234,6 +249,12 @@ func (s *Store) PruneVersions(ctx context.Context, id UUID, keep int) (int64, er
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("store: prune versions: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		// The deletion may have committed. Keep the objects if the outcome is
+		// ambiguous; a committed row deletion makes them orphans, but deleting
+		// them before confirmation could break a row that survived.
 		return 0, fmt.Errorf("store: prune versions: %w", err)
 	}
 	// Rows first, objects second: see blobs.go.

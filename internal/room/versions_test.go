@@ -25,7 +25,7 @@ type fakeVersions struct {
 	now      func() time.Time
 }
 
-func (f *fakeVersions) SaveVersion(_ context.Context, _ store.UUID, v store.Version, minAge time.Duration) (bool, error) {
+func (f *fakeVersions) SaveVersion(_ context.Context, _ store.UUID, _ store.UUID, _ int64, v store.Version, minAge time.Duration) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.saveErr != nil {
@@ -47,7 +47,7 @@ func (f *fakeVersions) SaveVersion(_ context.Context, _ store.UUID, v store.Vers
 	return true, nil
 }
 
-func (f *fakeVersions) PruneVersions(_ context.Context, _ store.UUID, keep int) (int64, error) {
+func (f *fakeVersions) PruneVersions(_ context.Context, _ store.UUID, _ store.UUID, _ int64, keep int) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pruned = append(f.pruned, keep)
@@ -224,13 +224,47 @@ func TestTakeVersionSurvivesAFailingStore(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if written, err := r.TakeVersion("x"); written || err != nil {
-			t.Errorf("TakeVersion = %v, %v; want false, nil", written, err)
+		if written, err := r.TakeVersion("x"); written || !errors.Is(err, versions.saveErr) {
+			t.Errorf("TakeVersion = %v, %v; want false, store error", written, err)
 		}
 	}()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("TakeVersion never returned while the store was failing")
+	}
+}
+
+func TestVersionCompletionWinsSimultaneousWriterShutdown(t *testing.T) {
+	done := make(chan struct{})
+	persistDone := make(chan struct{})
+	result := make(chan error, 1)
+	result <- nil
+	close(done)
+	close(persistDone)
+	writtenValue := true
+	if written, err := waitVersion(done, persistDone, result, &writtenValue); !written || err != nil {
+		t.Fatalf("completed version during shutdown = %v, %v; want true, nil", written, err)
+	}
+
+	unfinished := make(chan struct{})
+	close(unfinished)
+	if written, err := waitVersion(make(chan struct{}), unfinished, make(chan error, 1), &writtenValue); written || !errors.Is(err, ErrClosed) {
+		t.Fatalf("unfinished version during shutdown = %v, %v; want false, ErrClosed", written, err)
+	}
+}
+
+func TestCommandReplyWinsSimultaneousRoomShutdown(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	reply := make(chan error, 1)
+	want := errors.New("stale document")
+	reply <- want
+	if got := waitCommandReply(reply, done); !errors.Is(got, want) {
+		t.Fatalf("waitCommandReply() = %v, want %v", got, want)
+	}
+
+	if got := waitCommandReply(make(chan error, 1), done); !errors.Is(got, ErrClosed) {
+		t.Fatalf("waitCommandReply() without a result = %v, want %v", got, ErrClosed)
 	}
 }
