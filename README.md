@@ -803,6 +803,7 @@ go test ./... -race
 
 Some tests need real infrastructure and skip without it. All three come up together:
 Creating the test bucket also requires AWS CLI v2.
+Compose stores RustFS data in Docker's anonymous volume, which survives a stop and restart.
 
 ```sh
 docker compose -f deploy/docker-compose.yml up -d
